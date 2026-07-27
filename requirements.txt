@@ -1,1 +1,3 @@
 highrise-bot-sdk==25.1.0
+aiohttp
+openai>=1.0.0
