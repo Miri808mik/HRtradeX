@@ -6,6 +6,19 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from highrise import BaseBot, User, SessionMetadata
 
 
+# ---------- Default dance commands ----------
+# اسم دستور -> emote_id واقعی Highrise
+# می‌تونی بعداً هر emote_id دیگه‌ای که پیدا کردی رو همینجا اضافه کنی
+DEFAULT_DANCES = {
+    "macarena": "dance-macarena",
+    "hello": "emote-hello",
+    "tired": "emote-tired",
+}
+
+# رقص‌هایی که از داخل چت با !adddance اضافه میشن (فقط تا وقتی بات ری‌استارت نشده باقی می‌مونن)
+runtime_dances = {}
+
+
 # ---------- Fake HTTP server so Render's free Web Service stays alive ----------
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -25,15 +38,65 @@ def run_fake_server():
 
 # ---------- The actual Highrise bot ----------
 class Bot(BaseBot):
+    def __init__(self):
+        super().__init__()
+        self.owner_id = None
+
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot has started!")
+        self.owner_id = session_metadata.room_info.owner_id
 
     async def on_user_join(self, user: User, position) -> None:
         await self.highrise.chat(f"سلام {user.username} خوش اومدی! 👋")
 
+    def get_dance_id(self, name: str):
+        name = name.lower()
+        if name in runtime_dances:
+            return runtime_dances[name]
+        return DEFAULT_DANCES.get(name)
+
     async def on_chat(self, user: User, message: str) -> None:
-        if message.lower() == "!ping":
+        if not message.startswith("!"):
+            return
+
+        parts = message[1:].split(" ", 1)
+        command = parts[0].lower()
+        rest = parts[1] if len(parts) > 1 else ""
+
+        # --- !ping ---
+        if command == "ping":
             await self.highrise.chat("pong 🏓")
+            return
+
+        # --- !dancelist : لیست رقص‌های موجود ---
+        if command == "dancelist":
+            all_names = list(DEFAULT_DANCES.keys()) + list(runtime_dances.keys())
+            await self.highrise.chat("رقص‌های موجود: " + ", ".join(all_names))
+            return
+
+        # --- !adddance <name> <emote_id> : فقط برای صاحب اتاق ---
+        if command == "adddance":
+            if user.id != self.owner_id:
+                await self.highrise.chat("فقط صاحب اتاق می‌تونه رقص جدید اضافه کنه.")
+                return
+            args = rest.split(" ", 1)
+            if len(args) < 2:
+                await self.highrise.chat("فرمت درست: !adddance اسم emote_id")
+                return
+            new_name, new_emote_id = args[0].lower(), args[1].strip()
+            runtime_dances[new_name] = new_emote_id
+            await self.highrise.chat(f"رقص '{new_name}' اضافه شد ✅ (تا ریست بعدی می‌مونه)")
+            return
+
+        # --- !<dance_name> [متن اختیاری] : اجرای رقص + ارسال پیام ---
+        emote_id = self.get_dance_id(command)
+        if emote_id:
+            try:
+                await self.highrise.send_emote(emote_id)
+            except Exception as e:
+                print(f"Emote error: {e}")
+            if rest:
+                await self.highrise.chat(rest)
 
 
 if __name__ == "__main__":
