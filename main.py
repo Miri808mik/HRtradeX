@@ -61,8 +61,7 @@ def gold_bar_name(amount: int):
 
 
 class Bot(BaseBot):
-    # ---------- زمان‌بندی پیش‌فرض (قابل تغییر زنده از چت) ----------
-    DEFAULT_INTERVAL = 4.0  # ثانیه - این یه مقدار حدسیه، باید خودت با تست دقیقش کنی
+    DEFAULT_INTERVAL = 4.5   # مقدار پیش‌فرض (با تست دقیق‌ترش کن)
 
     def __init__(self):
         super().__init__()
@@ -70,11 +69,7 @@ class Bot(BaseBot):
         self.user_dance_states: dict[str, tuple[asyncio.Event, asyncio.Task]] = {}
         self.bot_dance_task: asyncio.Task | None = None
         self.owner_id = None
-
-        # هر emote_id می‌تونه فاصله زمانی مخصوص خودشو داشته باشه
-        # با دستور !settiming <emote_id> <seconds> این مقدارها رو زنده عوض کن
         self.emote_intervals: dict[str, float] = {}
-
         self.bot_dance_id = "dance-floss"
 
     def get_interval(self, emote_id: str) -> float:
@@ -83,6 +78,7 @@ class Bot(BaseBot):
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot has started!")
         self.owner_id = session_metadata.room_info.owner_id
+
         if self.bot_dance_task is None or self.bot_dance_task.done():
             self.bot_dance_task = asyncio.create_task(self._bot_dance_loop())
 
@@ -94,8 +90,9 @@ class Bot(BaseBot):
         self.active_users.pop(user.id, None)
         await self._stop_user_dance(user.id)
 
+    # ==================== لوپ دنس بات ====================
     async def _bot_dance_loop(self) -> None:
-        await asyncio.sleep(1)
+        await asyncio.sleep(1.5)
         while True:
             try:
                 await self.highrise.send_emote(self.bot_dance_id)
@@ -103,32 +100,35 @@ class Bot(BaseBot):
                 raise
             except Exception as e:
                 print(f"Bot dance error: {e}")
+
             await asyncio.sleep(self.get_interval(self.bot_dance_id))
 
+    # ==================== لوپ دنس کاربر (نسخه تمیز) ====================
     async def _user_dance_loop(self, user_id: str, emote_id: str, stop_event: asyncio.Event) -> None:
-        await asyncio.sleep(0.4)
+        # یه مکث خیلی کوتاه اول کار که دستور قبلی کامل تموم بشه
+        await asyncio.sleep(0.3)
+
         while not stop_event.is_set():
             try:
                 await self.highrise.send_emote(emote_id, target_user_id=user_id)
-            except TypeError:
-                try:
-                    await self.highrise.send_emote(emote_id)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    print(f"User dance fallback error: {e}")
-                    return
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                print(f"User dance error: {e}")
-                return
+                print(f"User dance error ({user_id}): {e}")
+                # اگه خطا داد، کمی صبر کن و دوباره امتحان کن (کاربر ممکنه موقتاً مشکل داشته باشه)
+                await asyncio.sleep(1.5)
+                continue
 
             interval = self.get_interval(emote_id)
-            with suppress(asyncio.TimeoutError):
+
+            # صبر کردن تا یا زمان تموم بشه یا دستور stop بیاد
+            try:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass  # زمان تموم شد → دوباره دنس بفرست
 
     def _start_user_dance(self, user: User, emote_id: str) -> None:
+        # اگه قبلاً دنس داشته، کامل متوقفش کن
         old_state = self.user_dance_states.get(user.id)
         if old_state:
             old_event, old_task = old_state
@@ -144,14 +144,17 @@ class Bot(BaseBot):
         state = self.user_dance_states.pop(user_id, None)
         if not state:
             return False
+
         stop_event, task = state
         stop_event.set()
         if not task.done():
             task.cancel()
+
         with suppress(asyncio.CancelledError):
             await task
         return True
 
+    # ==================== تیپ ====================
     async def _tip_all(self, amount: int, actor: User) -> None:
         bar_name = gold_bar_name(amount)
         if not bar_name:
@@ -159,10 +162,12 @@ class Bot(BaseBot):
                 f"@{actor.username} فعلاً فقط این مقدارها پشتیبانی می‌شن: 1، 5، 10، 50، 100، 500، 1000، 5000، 10000"
             )
             return
+
         targets = [u for uid, u in self.active_users.items() if uid != actor.id]
         if not targets:
             await self.highrise.chat(f"@{actor.username} کسی داخل اتاق نیست.")
             return
+
         success = failed = 0
         for target in targets:
             try:
@@ -170,12 +175,14 @@ class Bot(BaseBot):
                 success += 1
             except Exception as e:
                 failed += 1
-                print(f"Tip failed for {target.username} ({target.id}): {e}")
+                print(f"Tip failed for {target.username}: {e}")
+
         if failed == 0:
             await self.highrise.chat(f"@{actor.username} تیپ انجام شد ✅")
         else:
             await self.highrise.chat(f"@{actor.username} تیپ انجام شد ✅ | موفق: {success} | ناموفق: {failed}")
 
+    # ==================== چت ====================
     async def on_chat(self, user: User, message: str) -> None:
         text = message.strip()
         lower = text.casefold()
@@ -184,7 +191,7 @@ class Bot(BaseBot):
             await self.highrise.chat("pong 🏓")
             return
 
-        if lower in {"stop", "متوقف", "استوپ"}:
+        if lower in {"stop", "متوقف", "استوپ", "!stop"}:
             stopped = await self._stop_user_dance(user.id)
             await self.highrise.chat(
                 f"@{user.username} متوقف شد ✅" if stopped else f"@{user.username} دنس فعالی نداری"
@@ -203,25 +210,32 @@ class Bot(BaseBot):
             await self._tip_all(amount, user)
             return
 
-        # --- !settiming <emote_id> <seconds> : فقط صاحب اتاق، برای تنظیم زنده‌ی زمان‌بندی ---
+        # تنظیم زمان‌بندی زنده
         if lower.startswith("!settiming"):
             if user.id != self.owner_id:
                 await self.highrise.chat("فقط صاحب اتاق می‌تونه زمان‌بندی رو عوض کنه.")
                 return
+
             parts = text.split()
             if len(parts) != 3:
-                await self.highrise.chat("فرمت درست: !settiming emote_id 3.5")
+                await self.highrise.chat("فرمت درست: !settiming emote_id 3.8")
                 return
+
             emote_id, seconds_str = parts[1], parts[2]
             try:
                 seconds = float(seconds_str)
+                if seconds < 1.5:
+                    await self.highrise.chat("حداقل زمان ۱.۵ ثانیه باشه.")
+                    return
             except ValueError:
                 await self.highrise.chat("عدد ثانیه معتبر نیست.")
                 return
+
             self.emote_intervals[emote_id] = seconds
-            await self.highrise.chat(f"زمان‌بندی '{emote_id}' روی {seconds} ثانیه تنظیم شد ✅")
+            await self.highrise.chat(f"زمان‌بندی `{emote_id}` روی **{seconds}** ثانیه تنظیم شد ✅")
             return
 
+        # دستور دنس: /emote_id یا /لینک
         if not text.startswith("/"):
             return
 
@@ -236,7 +250,8 @@ class Bot(BaseBot):
             return
 
         self._start_user_dance(user, emote_id)
-        await self.highrise.chat(f"@{user.username} اجرا شد ✅ (زمان‌بندی: {self.get_interval(emote_id)}s)")
+        interval = self.get_interval(emote_id)
+        await self.highrise.chat(f"@{user.username} اجرا شد ✅ (هر {interval} ثانیه)")
 
 
 if __name__ == "__main__":
