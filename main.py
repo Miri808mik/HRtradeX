@@ -4,7 +4,7 @@ import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from openai import AsyncOpenAI
+import aiohttp
 from highrise import BaseBot, SessionMetadata, User
 
 
@@ -16,7 +16,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is running!")
 
     def log_message(self, format, *args):
-        pass  # keep logs clean
+        pass
 
 
 def run_fake_server():
@@ -25,47 +25,50 @@ def run_fake_server():
     server.serve_forever()
 
 
-# ---------- GapGPT client ----------
-gap_client = AsyncOpenAI(
-    api_key=os.environ.get("AI_API_KEY", ""),
-    base_url="https://api.gapgpt.app/v1",
-)
-
-
+# ---------- GapGPT ----------
 async def ask_ai(user_text: str) -> str:
-    if not os.environ.get("AI_API_KEY"):
+    api_key = os.environ.get("AI_API_KEY", "").strip()
+    if not api_key:
         return "AI_API_KEY تنظیم نشده."
 
+    url = "https://api.gapgpt.app/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "gpt-4o",
+        "messages": [
+            {
+                "role": "system",
+                "content": "تو یک دستیار فارسی کوتاه، صمیمی و مفید برای چت داخل بازی Highrise هستی. پاسخ‌ها کوتاه باشند.",
+            },
+            {
+                "role": "user",
+                "content": user_text,
+            },
+        ],
+        "temperature": 0.7,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=20)
+
     try:
-        response = await gap_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "تو یک دستیار فارسی کوتاه، صمیمی و مفید برای چت داخل بازی Highrise هستی. پاسخ‌ها کوتاه و طبیعی باشند.",
-                },
-                {
-                    "role": "user",
-                    "content": user_text,
-                },
-            ],
-            temperature=0.7,
-        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                data = await resp.json(content_type=None)
 
-        reply = response.choices[0].message.content or ""
-        reply = reply.strip()
+                if resp.status != 200:
+                    return f"خطا از GapGPT: {resp.status}"
 
-        if not reply:
-            return "پاسخی نداد."
-
-        return reply[:250]
-
+                reply = data["choices"][0]["message"]["content"].strip()
+                return reply[:250] if reply else "پاسخی نداد."
     except Exception as e:
         print(f"AI error: {e}")
         return "خطا در ارتباط با هوش مصنوعی."
 
 
-# ---------- The actual Highrise bot ----------
+# ---------- Highrise bot ----------
 class Bot(BaseBot):
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot started")
