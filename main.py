@@ -1,5 +1,7 @@
 import os
 import threading
+import subprocess
+import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -96,15 +98,20 @@ class Bot(BaseBot):
 
 
 if __name__ == "__main__":
-    # Start fake HTTP server in a background thread
-    threading.Thread(target=run_fake_server, daemon=True).start()
-
-    # Run the Highrise bot
-    from highrise.__main__ import main as highrise_main
-
     room_id = os.environ.get("ROOM_ID")
     api_token = os.environ.get("API_TOKEN")
 
-    import sys
-    sys.argv = ["highrise", "main:Bot", room_id, api_token]
-    highrise_main()
+    if not room_id or not api_token:
+        print("ROOM_ID or API_TOKEN is missing.", file=sys.stderr)
+        sys.exit(1)
+
+    # Start fake HTTP server in a background thread
+    threading.Thread(target=run_fake_server, daemon=True).start()
+
+    # Run the Highrise bot using the official CLI entrypoint
+    # This matches the SDK docs: highrise mybot:Bot <room ID> <API token>
+    result = subprocess.run(
+        ["highrise", "main:Bot", room_id, api_token],
+        check=False,
+    )
+    sys.exit(result.returncode)
