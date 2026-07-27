@@ -40,12 +40,12 @@ if __name__ == "__main__":
     # Start fake HTTP server in a background thread
     threading.Thread(target=run_fake_server, daemon=True).start()
 
-    # Run the Highrise bot
-    from highrise.__main__ import main as highrise_main
+    # Run the Highrise bot using the SDK's programmatic API
+    from highrise.__main__ import main as highrise_main, BotDefinition
+    from asyncio import run as arun
 
     room_id = os.environ.get("ROOM_ID")
     api_token = os.environ.get("API_TOKEN")
 
-    import sys
-    sys.argv = ["highrise", "main:Bot", room_id, api_token]
-    highrise_main()
+    definitions = [BotDefinition(Bot(), room_id, api_token)]
+    arun(highrise_main(definitions))
