@@ -2,11 +2,9 @@ import os
 import threading
 import subprocess
 import sys
-import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlparse
 
-import aiohttp
+from openai import AsyncOpenAI
 from highrise import BaseBot, SessionMetadata, User
 
 
@@ -18,7 +16,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is running!")
 
     def log_message(self, format, *args):
-        pass
+        pass  # keep logs clean
 
 
 def run_fake_server():
@@ -27,56 +25,47 @@ def run_fake_server():
     server.serve_forever()
 
 
+# ---------- GapGPT client ----------
+gap_client = AsyncOpenAI(
+    api_key=os.environ.get("AI_API_KEY", ""),
+    base_url="https://api.gapgpt.app/v1",
+)
+
+
 async def ask_ai(user_text: str) -> str:
-    api_key = os.environ.get("AI_API_KEY", "").strip()
-    base_url = os.environ.get("AI_BASE_URL", "").strip().rstrip("/")
-    model = os.environ.get("AI_MODEL", "default").strip()
-
-    if not api_key or not base_url:
-        return "توکن هوش مصنوعی تنظیم نشده."
-
-    url = f"{base_url}/chat/completions"
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "تو یک دستیار کوتاه، صمیمی و فارسی‌زبان برای چت داخل بازی هستی.",
-            },
-            {
-                "role": "user",
-                "content": user_text,
-            },
-        ],
-        "temperature": 0.7,
-    }
-
-    timeout = aiohttp.ClientTimeout(total=20)
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, headers=headers, json=payload) as resp:
-            text = await resp.text()
-
-            if resp.status != 200:
-                return f"خطا در پاسخ هوش مصنوعی: {resp.status}"
-
-            try:
-                data = await resp.json()
-            except Exception:
-                return "پاسخ هوش مصنوعی قابل خواندن نبود."
+    if not os.environ.get("AI_API_KEY"):
+        return "AI_API_KEY تنظیم نشده."
 
     try:
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception:
-        return "هوش مصنوعی جواب نداد."
+        response = await gap_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "تو یک دستیار فارسی کوتاه، صمیمی و مفید برای چت داخل بازی Highrise هستی. پاسخ‌ها کوتاه و طبیعی باشند.",
+                },
+                {
+                    "role": "user",
+                    "content": user_text,
+                },
+            ],
+            temperature=0.7,
+        )
+
+        reply = response.choices[0].message.content or ""
+        reply = reply.strip()
+
+        if not reply:
+            return "پاسخی نداد."
+
+        return reply[:250]
+
+    except Exception as e:
+        print(f"AI error: {e}")
+        return "خطا در ارتباط با هوش مصنوعی."
 
 
+# ---------- The actual Highrise bot ----------
 class Bot(BaseBot):
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot started")
@@ -91,20 +80,9 @@ class Bot(BaseBot):
             await self.highrise.chat("pong 🏓")
             return
 
-        if text.startswith("!سلام"):
-            prompt = f"به فارسی، خیلی کوتاه و دوستانه به این پیام جواب بده: {text}"
-            reply = await ask_ai(prompt)
-            await self.highrise.chat(reply[:250])
-            return
-
-        if text.startswith("!ai "):
-            prompt = text[4:].strip()
-            if not prompt:
-                await self.highrise.chat("متن هوش مصنوعی خالیه.")
-                return
-
-            reply = await ask_ai(prompt)
-            await self.highrise.chat(reply[:250])
+        if text == "!سلام":
+            reply = await ask_ai("به فارسی و خیلی کوتاه جواب بده: سلام!")
+            await self.highrise.chat(reply)
             return
 
 
