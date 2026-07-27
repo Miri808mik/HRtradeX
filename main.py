@@ -51,44 +51,160 @@ def extract_emote_id(raw_value: str) -> str | None:
     return value
 
 
+def parse_tip_amount(text: str) -> int | None:
+    try:
+        value = int(text.strip())
+        if value <= 0:
+            return None
+        return value
+    except Exception:
+        return None
+
+
+def gold_bar_name(amount: int) -> str | None:
+    allowed = {
+        1: "gold_bar_1",
+        5: "gold_bar_5",
+        10: "gold_bar_10",
+        50: "gold_bar_50",
+        100: "gold_bar_100",
+        500: "gold_bar_500",
+        1000: "gold_bar_1k",
+        5000: "gold_bar_5000",
+        10000: "gold_bar_10k",
+    }
+    return allowed.get(amount)
+
+
 # ---------- The actual Highrise bot ----------
 class Bot(BaseBot):
-    AUTO_DANCE_ID = "dance-floss"
-    AUTO_DANCE_DELAY = 8  # seconds between repeats
+    BOT_DANCE_ID = "dance-floss"
+    BOT_DANCE_DELAY = 8
+    USER_DANCE_DELAY = 8
 
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot has started!")
 
-        # Start the endless auto-dance loop
-        if not hasattr(self, "_auto_dance_task") or self._auto_dance_task.done():
-            self._auto_dance_task = asyncio.create_task(self._auto_dance_loop())
+        self.active_users = {}
+        self.user_dance_tasks = {}
+        self.bot_dance_task = None
 
-    async def _auto_dance_loop(self) -> None:
-        await asyncio.sleep(2)  # short delay after join
+        if self.bot_dance_task is None or self.bot_dance_task.done():
+            self.bot_dance_task = asyncio.create_task(self._bot_dance_loop())
+
+    async def on_user_join(self, user: User, position) -> None:
+        self.active_users[user.id] = user
+        await self.highrise.chat(f"سلام {user.username} خوش اومدی! 👋")
+        await self.highrise.chat(f"@{user.username} الان بات داره می‌رقصه و آماده‌ست 🎵")
+
+    async def on_user_leave(self, user: User) -> None:
+        self.active_users.pop(user.id, None)
+
+        task = self.user_dance_tasks.pop(user.id, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _bot_dance_loop(self) -> None:
+        await asyncio.sleep(2)
 
         while True:
             try:
-                await self.highrise.send_emote(self.AUTO_DANCE_ID)
+                await self.highrise.send_emote(self.BOT_DANCE_ID)
             except Exception as e:
                 print(f"Auto-dance error: {e}")
 
-            await asyncio.sleep(self.AUTO_DANCE_DELAY)
+            await asyncio.sleep(self.BOT_DANCE_DELAY)
 
-    async def on_user_join(self, user: User, position) -> None:
-        await self.highrise.chat(f"سلام {user.username} خوش اومدی! 👋")
+    async def _user_dance_loop(self, user: User, emote_id: str) -> None:
+        await asyncio.sleep(1)
+
+        use_target = True
+        while True:
+            try:
+                if use_target:
+                    await self.highrise.send_emote(emote_id, target_user_id=user.id)
+                else:
+                    await self.highrise.send_emote(emote_id)
+            except TypeError:
+                use_target = False
+                try:
+                    await self.highrise.send_emote(emote_id)
+                except Exception as e:
+                    print(f"User dance fallback error: {e}")
+            except Exception as e:
+                print(f"User dance error: {e}")
+
+            await asyncio.sleep(self.USER_DANCE_DELAY)
+
+    def _start_user_dance(self, user: User, emote_id: str) -> None:
+        old_task = self.user_dance_tasks.get(user.id)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
+        task = asyncio.create_task(self._user_dance_loop(user, emote_id))
+        self.user_dance_tasks[user.id] = task
+
+    async def _tip_all(self, amount: int, actor: User) -> None:
+        bar_name = gold_bar_name(amount)
+        if not bar_name:
+            await self.highrise.chat(
+                f"@{actor.username} فقط این مقدارها فعلاً پشتیبانی می‌شن: 1, 5, 10, 50, 100, 500, 1000, 5000, 10000"
+            )
+            return
+
+        if not self.active_users:
+            await self.highrise.chat(f"@{actor.username} کسی داخل اتاق نیست که تیپ بگیره.")
+            return
+
+        success = 0
+        failed = 0
+
+        for uid, user in list(self.active_users.items()):
+            try:
+                await self.highrise.tip_user(uid, bar_name)
+                success += 1
+            except Exception as e:
+                failed += 1
+                print(f"Tip failed for {user.username} ({uid}): {e}")
+
+        if failed == 0:
+            await self.highrise.chat(f"@{actor.username} به {success} نفر، هر نفر {amount} گلد تیپ شد ✅")
+        else:
+            await self.highrise.chat(
+                f"@{actor.username} تیپ انجام شد ✅ | موفق: {success} | ناموفق: {failed}"
+            )
 
     async def on_chat(self, user: User, message: str) -> None:
-        if message.lower() == "!ping":
+        text = message.strip()
+        lower = text.lower()
+
+        if lower == "!ping":
             await self.highrise.chat("pong 🏓")
+            return
+
+        # Tip command:
+        # tip all 5
+        if lower.startswith("tip all "):
+            parts = text.split()
+            if len(parts) != 3:
+                await self.highrise.chat(f"@{user.username} فرمت درست: tip all 5")
+                return
+
+            amount = parse_tip_amount(parts[2])
+            if amount is None:
+                await self.highrise.chat(f"@{user.username} عدد تیپ معتبر نیست.")
+                return
+
+            await self._tip_all(amount, user)
             return
 
         # Optional manual dance command:
         # /dance-twerk
         # /https://high.rs/item?id=dance-twerk&type=emote
-        if not message.startswith("/"):
+        if not text.startswith("/"):
             return
 
-        payload = message[1:].strip()
+        payload = text[1:].strip()
         if not payload:
             await self.highrise.chat(f"@{user.username} فرمت درست نیست. مثال: /dance-twerk")
             return
@@ -98,18 +214,8 @@ class Bot(BaseBot):
             await self.highrise.chat(f"@{user.username} دنس معتبر نیست.")
             return
 
-        try:
-            await self.highrise.send_emote(emote_id, target_user_id=user.id)
-            return
-        except TypeError:
-            pass
-        except Exception:
-            pass
-
-        try:
-            await self.highrise.send_emote(emote_id)
-        except Exception:
-            await self.highrise.chat(f"@{user.username} اجرای این دنس ممکن نیست.")
+        self._start_user_dance(user, emote_id)
+        await self.highrise.chat(f"@{user.username} دنس {emote_id} شروع شد و هی تکرار میشه ✅")
 
 
 if __name__ == "__main__":
