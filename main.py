@@ -2,6 +2,7 @@ import os
 import threading
 import subprocess
 import sys
+import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -52,8 +53,26 @@ def extract_emote_id(raw_value: str) -> str | None:
 
 # ---------- The actual Highrise bot ----------
 class Bot(BaseBot):
+    AUTO_DANCE_ID = "dance-floss"
+    AUTO_DANCE_DELAY = 8  # seconds between repeats
+
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot has started!")
+
+        # Start the endless auto-dance loop
+        if not hasattr(self, "_auto_dance_task") or self._auto_dance_task.done():
+            self._auto_dance_task = asyncio.create_task(self._auto_dance_loop())
+
+    async def _auto_dance_loop(self) -> None:
+        await asyncio.sleep(2)  # short delay after join
+
+        while True:
+            try:
+                await self.highrise.send_emote(self.AUTO_DANCE_ID)
+            except Exception as e:
+                print(f"Auto-dance error: {e}")
+
+            await asyncio.sleep(self.AUTO_DANCE_DELAY)
 
     async def on_user_join(self, user: User, position) -> None:
         await self.highrise.chat(f"سلام {user.username} خوش اومدی! 👋")
@@ -63,7 +82,7 @@ class Bot(BaseBot):
             await self.highrise.chat("pong 🏓")
             return
 
-        # Dance command format:
+        # Optional manual dance command:
         # /dance-twerk
         # /https://high.rs/item?id=dance-twerk&type=emote
         if not message.startswith("/"):
@@ -79,18 +98,14 @@ class Bot(BaseBot):
             await self.highrise.chat(f"@{user.username} دنس معتبر نیست.")
             return
 
-        # First try to apply the emote to the same player.
         try:
             await self.highrise.send_emote(emote_id, target_user_id=user.id)
             return
         except TypeError:
-            # Older SDKs or signature mismatches may not accept target_user_id.
             pass
         except Exception:
-            # If targeting fails for any reason, fallback to self-emote below.
             pass
 
-        # Fallback: let the bot perform the emote itself.
         try:
             await self.highrise.send_emote(emote_id)
         except Exception:
@@ -109,7 +124,6 @@ if __name__ == "__main__":
     threading.Thread(target=run_fake_server, daemon=True).start()
 
     # Run the Highrise bot using the official CLI entrypoint
-    # This matches the SDK docs: highrise mybot:Bot <room ID> <API token>
     result = subprocess.run(
         ["highrise", "main:Bot", room_id, api_token],
         check=False,
