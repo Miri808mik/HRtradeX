@@ -1,7 +1,5 @@
 import os
 import threading
-import subprocess
-import sys
 import asyncio
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -10,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 from highrise import BaseBot, SessionMetadata, User
 
 
+# ---------- Fake HTTP server so Render's free Web Service stays alive ----------
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -26,30 +25,25 @@ def run_fake_server():
     server.serve_forever()
 
 
-def extract_emote_id(raw_value: str) -> str | None:
+def extract_emote_id(raw_value: str):
     value = raw_value.strip()
     if not value:
         return None
-
     if value.startswith(("http://", "https://")):
         parsed = urlparse(value)
         if "high.rs" not in parsed.netloc:
             return None
-
         query = parse_qs(parsed.query)
         emote_id = query.get("id", [None])[0]
         return emote_id.strip() if emote_id else None
-
     if value.startswith(("high.rs/", "www.high.rs/")):
         return extract_emote_id("https://" + value)
-
     if " " in value:
         return None
-
     return value
 
 
-def parse_tip_amount(text: str) -> int | None:
+def parse_tip_amount(text: str):
     try:
         amount = int(text.strip())
         return amount if amount > 0 else None
@@ -57,34 +51,38 @@ def parse_tip_amount(text: str) -> int | None:
         return None
 
 
-def gold_bar_name(amount: int) -> str | None:
+def gold_bar_name(amount: int):
     mapping = {
-        1: "gold_bar_1",
-        5: "gold_bar_5",
-        10: "gold_bar_10",
-        50: "gold_bar_50",
-        100: "gold_bar_100",
-        500: "gold_bar_500",
-        1000: "gold_bar_1k",
-        5000: "gold_bar_5000",
-        10000: "gold_bar_10k",
+        1: "gold_bar_1", 5: "gold_bar_5", 10: "gold_bar_10", 50: "gold_bar_50",
+        100: "gold_bar_100", 500: "gold_bar_500", 1000: "gold_bar_1k",
+        5000: "gold_bar_5000", 10000: "gold_bar_10k",
     }
     return mapping.get(amount)
 
 
 class Bot(BaseBot):
-    BOT_DANCE_ID = "dance-floss"
-    BOT_DANCE_DELAY = 1.9
-    USER_DANCE_DELAY = 2.0
+    # ---------- زمان‌بندی پیش‌فرض (قابل تغییر زنده از چت) ----------
+    DEFAULT_INTERVAL = 4.0  # ثانیه - این یه مقدار حدسیه، باید خودت با تست دقیقش کنی
 
     def __init__(self):
         super().__init__()
         self.active_users: dict[str, User] = {}
         self.user_dance_states: dict[str, tuple[asyncio.Event, asyncio.Task]] = {}
         self.bot_dance_task: asyncio.Task | None = None
+        self.owner_id = None
+
+        # هر emote_id می‌تونه فاصله زمانی مخصوص خودشو داشته باشه
+        # با دستور !settiming <emote_id> <seconds> این مقدارها رو زنده عوض کن
+        self.emote_intervals: dict[str, float] = {}
+
+        self.bot_dance_id = "dance-floss"
+
+    def get_interval(self, emote_id: str) -> float:
+        return self.emote_intervals.get(emote_id, self.DEFAULT_INTERVAL)
 
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot has started!")
+        self.owner_id = session_metadata.room_info.owner_id
         if self.bot_dance_task is None or self.bot_dance_task.done():
             self.bot_dance_task = asyncio.create_task(self._bot_dance_loop())
 
@@ -98,20 +96,17 @@ class Bot(BaseBot):
 
     async def _bot_dance_loop(self) -> None:
         await asyncio.sleep(1)
-
         while True:
             try:
-                await self.highrise.send_emote(self.BOT_DANCE_ID)
+                await self.highrise.send_emote(self.bot_dance_id)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 print(f"Bot dance error: {e}")
-
-            await asyncio.sleep(self.BOT_DANCE_DELAY)
+            await asyncio.sleep(self.get_interval(self.bot_dance_id))
 
     async def _user_dance_loop(self, user_id: str, emote_id: str, stop_event: asyncio.Event) -> None:
         await asyncio.sleep(0.4)
-
         while not stop_event.is_set():
             try:
                 await self.highrise.send_emote(emote_id, target_user_id=user_id)
@@ -129,10 +124,9 @@ class Bot(BaseBot):
                 print(f"User dance error: {e}")
                 return
 
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=self.USER_DANCE_DELAY)
-            except asyncio.TimeoutError:
-                pass
+            interval = self.get_interval(emote_id)
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
 
     def _start_user_dance(self, user: User, emote_id: str) -> None:
         old_state = self.user_dance_states.get(user.id)
@@ -150,12 +144,10 @@ class Bot(BaseBot):
         state = self.user_dance_states.pop(user_id, None)
         if not state:
             return False
-
         stop_event, task = state
         stop_event.set()
         if not task.done():
             task.cancel()
-
         with suppress(asyncio.CancelledError):
             await task
         return True
@@ -167,16 +159,11 @@ class Bot(BaseBot):
                 f"@{actor.username} فعلاً فقط این مقدارها پشتیبانی می‌شن: 1، 5، 10، 50، 100، 500، 1000، 5000، 10000"
             )
             return
-
         targets = [u for uid, u in self.active_users.items() if uid != actor.id]
-
         if not targets:
             await self.highrise.chat(f"@{actor.username} کسی داخل اتاق نیست.")
             return
-
-        success = 0
-        failed = 0
-
+        success = failed = 0
         for target in targets:
             try:
                 await self.highrise.tip_user(target.id, bar_name)
@@ -184,7 +171,6 @@ class Bot(BaseBot):
             except Exception as e:
                 failed += 1
                 print(f"Tip failed for {target.username} ({target.id}): {e}")
-
         if failed == 0:
             await self.highrise.chat(f"@{actor.username} تیپ انجام شد ✅")
         else:
@@ -200,10 +186,9 @@ class Bot(BaseBot):
 
         if lower in {"stop", "متوقف", "استوپ"}:
             stopped = await self._stop_user_dance(user.id)
-            if stopped:
-                await self.highrise.chat(f"@{user.username} متوقف شد ✅")
-            else:
-                await self.highrise.chat(f"@{user.username} دنس فعالی نداری")
+            await self.highrise.chat(
+                f"@{user.username} متوقف شد ✅" if stopped else f"@{user.username} دنس فعالی نداری"
+            )
             return
 
         if lower.startswith("tip all "):
@@ -211,13 +196,30 @@ class Bot(BaseBot):
             if len(parts) != 3:
                 await self.highrise.chat(f"@{user.username} فرمت درست: tip all 5")
                 return
-
             amount = parse_tip_amount(parts[2])
             if amount is None:
                 await self.highrise.chat(f"@{user.username} عدد معتبر نیست")
                 return
-
             await self._tip_all(amount, user)
+            return
+
+        # --- !settiming <emote_id> <seconds> : فقط صاحب اتاق، برای تنظیم زنده‌ی زمان‌بندی ---
+        if lower.startswith("!settiming"):
+            if user.id != self.owner_id:
+                await self.highrise.chat("فقط صاحب اتاق می‌تونه زمان‌بندی رو عوض کنه.")
+                return
+            parts = text.split()
+            if len(parts) != 3:
+                await self.highrise.chat("فرمت درست: !settiming emote_id 3.5")
+                return
+            emote_id, seconds_str = parts[1], parts[2]
+            try:
+                seconds = float(seconds_str)
+            except ValueError:
+                await self.highrise.chat("عدد ثانیه معتبر نیست.")
+                return
+            self.emote_intervals[emote_id] = seconds
+            await self.highrise.chat(f"زمان‌بندی '{emote_id}' روی {seconds} ثانیه تنظیم شد ✅")
             return
 
         if not text.startswith("/"):
@@ -234,21 +236,23 @@ class Bot(BaseBot):
             return
 
         self._start_user_dance(user, emote_id)
-        await self.highrise.chat(f"@{user.username} اجرا شد ✅")
+        await self.highrise.chat(f"@{user.username} اجرا شد ✅ (زمان‌بندی: {self.get_interval(emote_id)}s)")
 
 
 if __name__ == "__main__":
+    threading.Thread(target=run_fake_server, daemon=True).start()
+
+    from highrise.__main__ import main as highrise_main, BotDefinition
+    from asyncio import run as arun
+
     room_id = os.environ.get("ROOM_ID")
     api_token = os.environ.get("API_TOKEN")
 
+    print(f"DEBUG: ROOM_ID = {repr(room_id)}")
+    print(f"DEBUG: API_TOKEN length = {len(api_token) if api_token else 'None/empty'}")
+
     if not room_id or not api_token:
-        print("ROOM_ID or API_TOKEN is missing.", file=sys.stderr)
-        sys.exit(1)
+        raise SystemExit("ERROR: ROOM_ID or API_TOKEN environment variable is missing!")
 
-    threading.Thread(target=run_fake_server, daemon=True).start()
-
-    result = subprocess.run(
-        ["highrise", "main:Bot", room_id, api_token],
-        check=False,
-    )
-    sys.exit(result.returncode)
+    definitions = [BotDefinition(Bot(), room_id, api_token)]
+    arun(highrise_main(definitions))
