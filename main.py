@@ -1,22 +1,9 @@
 import os
-import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
-from highrise import BaseBot, User, SessionMetadata
-
-
-# ---------- Default dance commands ----------
-# اسم دستور -> emote_id واقعی Highrise
-# می‌تونی بعداً هر emote_id دیگه‌ای که پیدا کردی رو همینجا اضافه کنی
-DEFAULT_DANCES = {
-    "macarena": "dance-macarena",
-    "hello": "emote-hello",
-    "tired": "emote-tired",
-}
-
-# رقص‌هایی که از داخل چت با !adddance اضافه میشن (فقط تا وقتی بات ری‌استارت نشده باقی می‌مونن)
-runtime_dances = {}
+from highrise import BaseBot, SessionMetadata, User
 
 
 # ---------- Fake HTTP server so Render's free Web Service stays alive ----------
@@ -36,86 +23,88 @@ def run_fake_server():
     server.serve_forever()
 
 
+def extract_emote_id(raw_value: str) -> str | None:
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    # Accept either a plain emote id or a Highrise item link.
+    if value.startswith(("http://", "https://")):
+        parsed = urlparse(value)
+        if "high.rs" not in parsed.netloc:
+            return None
+
+        query = parse_qs(parsed.query)
+        emote_id = query.get("id", [None])[0]
+        return emote_id.strip() if emote_id else None
+
+    if value.startswith(("high.rs/", "www.high.rs/")):
+        return extract_emote_id("https://" + value)
+
+    # Plain emote id
+    if " " in value:
+        return None
+
+    return value
+
+
 # ---------- The actual Highrise bot ----------
 class Bot(BaseBot):
-    def __init__(self):
-        super().__init__()
-        self.owner_id = None
-
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot has started!")
-        self.owner_id = session_metadata.room_info.owner_id
 
     async def on_user_join(self, user: User, position) -> None:
         await self.highrise.chat(f"سلام {user.username} خوش اومدی! 👋")
 
-    def get_dance_id(self, name: str):
-        name = name.lower()
-        if name in runtime_dances:
-            return runtime_dances[name]
-        return DEFAULT_DANCES.get(name)
-
     async def on_chat(self, user: User, message: str) -> None:
-        if not message.startswith("!"):
-            return
-
-        parts = message[1:].split(" ", 1)
-        command = parts[0].lower()
-        rest = parts[1] if len(parts) > 1 else ""
-
-        # --- !ping ---
-        if command == "ping":
+        if message.lower() == "!ping":
             await self.highrise.chat("pong 🏓")
             return
 
-        # --- !dancelist : لیست رقص‌های موجود ---
-        if command == "dancelist":
-            all_names = list(DEFAULT_DANCES.keys()) + list(runtime_dances.keys())
-            await self.highrise.chat("رقص‌های موجود: " + ", ".join(all_names))
+        # Dance command format:
+        # /dance-twerk
+        # /https://high.rs/item?id=dance-twerk&type=emote
+        if not message.startswith("/"):
             return
 
-        # --- !adddance <name> <emote_id> : فقط برای صاحب اتاق ---
-        if command == "adddance":
-            if user.id != self.owner_id:
-                await self.highrise.chat("فقط صاحب اتاق می‌تونه رقص جدید اضافه کنه.")
-                return
-            args = rest.split(" ", 1)
-            if len(args) < 2:
-                await self.highrise.chat("فرمت درست: !adddance اسم emote_id")
-                return
-            new_name, new_emote_id = args[0].lower(), args[1].strip()
-            runtime_dances[new_name] = new_emote_id
-            await self.highrise.chat(f"رقص '{new_name}' اضافه شد ✅ (تا ریست بعدی می‌مونه)")
+        payload = message[1:].strip()
+        if not payload:
+            await self.highrise.chat(f"@{user.username} فرمت درست نیست. مثال: /dance-twerk")
             return
 
-        # --- !<dance_name> [متن اختیاری] : اجرای رقص + ارسال پیام ---
-        emote_id = self.get_dance_id(command)
-        if emote_id:
-            try:
-                await self.highrise.send_emote(emote_id)
-            except Exception as e:
-                print(f"Emote error: {e}")
-            if rest:
-                await self.highrise.chat(rest)
+        emote_id = extract_emote_id(payload)
+        if not emote_id:
+            await self.highrise.chat(f"@{user.username} دنس معتبر نیست.")
+            return
+
+        # First try to apply the emote to the same player.
+        try:
+            await self.highrise.send_emote(emote_id, target_user_id=user.id)
+            return
+        except TypeError:
+            # Older SDKs or signature mismatches may not accept target_user_id.
+            pass
+        except Exception:
+            # If targeting fails for any reason, fallback to self-emote below.
+            pass
+
+        # Fallback: let the bot perform the emote itself.
+        try:
+            await self.highrise.send_emote(emote_id)
+        except Exception:
+            await self.highrise.chat(f"@{user.username} اجرای این دنس ممکن نیست.")
 
 
 if __name__ == "__main__":
     # Start fake HTTP server in a background thread
     threading.Thread(target=run_fake_server, daemon=True).start()
 
-    # Run the Highrise bot using the SDK's programmatic API
-    from highrise.__main__ import main as highrise_main, BotDefinition
-    from asyncio import run as arun
+    # Run the Highrise bot
+    from highrise.__main__ import main as highrise_main
 
     room_id = os.environ.get("ROOM_ID")
     api_token = os.environ.get("API_TOKEN")
 
-    # Debug: confirm the environment variables were actually read
-    print(f"DEBUG: ROOM_ID = {repr(room_id)}")
-    print(f"DEBUG: API_TOKEN length = {len(api_token) if api_token else 'None/empty'}")
-
-    if not room_id or not api_token:
-        raise SystemExit("ERROR: ROOM_ID or API_TOKEN environment variable is missing!")
-
-    definitions = [BotDefinition(Bot(), room_id, api_token)]
-    arun(highrise_main(definitions))
+    import sys
+    sys.argv = ["highrise", "main:Bot", room_id, api_token]
+    highrise_main()
