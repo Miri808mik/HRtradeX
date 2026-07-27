@@ -47,5 +47,12 @@ if __name__ == "__main__":
     room_id = os.environ.get("ROOM_ID")
     api_token = os.environ.get("API_TOKEN")
 
+    # Debug: confirm the environment variables were actually read
+    print(f"DEBUG: ROOM_ID = {repr(room_id)}")
+    print(f"DEBUG: API_TOKEN length = {len(api_token) if api_token else 'None/empty'}")
+
+    if not room_id or not api_token:
+        raise SystemExit("ERROR: ROOM_ID or API_TOKEN environment variable is missing!")
+
     definitions = [BotDefinition(Bot(), room_id, api_token)]
     arun(highrise_main(definitions))
