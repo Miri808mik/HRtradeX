@@ -1,1 +1,1 @@
-highrise-bot-sdk==25.1.0
+!settiming dance-floss 5.2
