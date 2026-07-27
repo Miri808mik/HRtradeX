@@ -3,6 +3,7 @@ import threading
 import subprocess
 import sys
 import asyncio
+from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -73,18 +74,17 @@ def gold_bar_name(amount: int) -> str | None:
 
 class Bot(BaseBot):
     BOT_DANCE_ID = "dance-floss"
-    BOT_DANCE_DELAY = 0.8
-    USER_DANCE_DELAY = 0.8
+    BOT_DANCE_DELAY = 1.9
+    USER_DANCE_DELAY = 2.0
 
     def __init__(self):
         super().__init__()
         self.active_users: dict[str, User] = {}
-        self.user_dance_tasks: dict[str, asyncio.Task] = {}
+        self.user_dance_states: dict[str, tuple[asyncio.Event, asyncio.Task]] = {}
         self.bot_dance_task: asyncio.Task | None = None
 
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot has started!")
-
         if self.bot_dance_task is None or self.bot_dance_task.done():
             self.bot_dance_task = asyncio.create_task(self._bot_dance_loop())
 
@@ -94,10 +94,7 @@ class Bot(BaseBot):
 
     async def on_user_leave(self, user: User) -> None:
         self.active_users.pop(user.id, None)
-
-        task = self.user_dance_tasks.pop(user.id, None)
-        if task and not task.done():
-            task.cancel()
+        await self._stop_user_dance(user.id)
 
     async def _bot_dance_loop(self) -> None:
         await asyncio.sleep(1)
@@ -105,43 +102,63 @@ class Bot(BaseBot):
         while True:
             try:
                 await self.highrise.send_emote(self.BOT_DANCE_ID)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 print(f"Bot dance error: {e}")
 
             await asyncio.sleep(self.BOT_DANCE_DELAY)
 
-    async def _user_dance_loop(self, user: User, emote_id: str) -> None:
-        await asyncio.sleep(0.5)
+    async def _user_dance_loop(self, user_id: str, emote_id: str, stop_event: asyncio.Event) -> None:
+        await asyncio.sleep(0.4)
 
-        while True:
+        while not stop_event.is_set():
             try:
-                await self.highrise.send_emote(emote_id, target_user_id=user.id)
+                await self.highrise.send_emote(emote_id, target_user_id=user_id)
             except TypeError:
                 try:
                     await self.highrise.send_emote(emote_id)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     print(f"User dance fallback error: {e}")
                     return
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 print(f"User dance error: {e}")
                 return
 
-            await asyncio.sleep(self.USER_DANCE_DELAY)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=self.USER_DANCE_DELAY)
+            except asyncio.TimeoutError:
+                pass
 
     def _start_user_dance(self, user: User, emote_id: str) -> None:
-        old_task = self.user_dance_tasks.get(user.id)
-        if old_task and not old_task.done():
-            old_task.cancel()
+        old_state = self.user_dance_states.get(user.id)
+        if old_state:
+            old_event, old_task = old_state
+            old_event.set()
+            if not old_task.done():
+                old_task.cancel()
 
-        task = asyncio.create_task(self._user_dance_loop(user, emote_id))
-        self.user_dance_tasks[user.id] = task
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(self._user_dance_loop(user.id, emote_id, stop_event))
+        self.user_dance_states[user.id] = (stop_event, task)
 
-    def _stop_user_dance(self, user: User) -> bool:
-        task = self.user_dance_tasks.pop(user.id, None)
-        if task and not task.done():
+    async def _stop_user_dance(self, user_id: str) -> bool:
+        state = self.user_dance_states.pop(user_id, None)
+        if not state:
+            return False
+
+        stop_event, task = state
+        stop_event.set()
+        if not task.done():
             task.cancel()
-            return True
-        return False
+
+        with suppress(asyncio.CancelledError):
+            await task
+        return True
 
     async def _tip_all(self, amount: int, actor: User) -> None:
         bar_name = gold_bar_name(amount)
@@ -151,10 +168,7 @@ class Bot(BaseBot):
             )
             return
 
-        targets = [
-            u for uid, u in self.active_users.items()
-            if uid != actor.id
-        ]
+        targets = [u for uid, u in self.active_users.items() if uid != actor.id]
 
         if not targets:
             await self.highrise.chat(f"@{actor.username} کسی داخل اتاق نیست.")
@@ -185,7 +199,8 @@ class Bot(BaseBot):
             return
 
         if lower in {"stop", "متوقف", "استوپ"}:
-            if self._stop_user_dance(user):
+            stopped = await self._stop_user_dance(user.id)
+            if stopped:
                 await self.highrise.chat(f"@{user.username} متوقف شد ✅")
             else:
                 await self.highrise.chat(f"@{user.username} دنس فعالی نداری")
