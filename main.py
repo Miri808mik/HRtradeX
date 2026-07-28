@@ -3,12 +3,12 @@ import threading
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections import defaultdict, deque
 
 import aiohttp
 from highrise import BaseBot, SessionMetadata, User
 
 
-# ---------- Fake HTTP server so Render's free Web Service stays alive ----------
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -25,68 +25,107 @@ def run_fake_server():
     server.serve_forever()
 
 
-# ---------- GapGPT ----------
-async def ask_ai(user_text: str) -> str:
-    api_key = os.environ.get("AI_API_KEY", "").strip()
-    if not api_key:
-        return "AI_API_KEY تنظیم نشده."
-
-    url = "https://api.gapgpt.app/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": "gpt-4o",
-        "messages": [
-            {
-                "role": "system",
-                "content": "تو یک دستیار فارسی کوتاه، صمیمی و مفید برای چت داخل بازی Highrise هستی. پاسخ‌ها کوتاه باشند.",
-            },
-            {
-                "role": "user",
-                "content": user_text,
-            },
-        ],
-        "temperature": 0.7,
-    }
-
-    timeout = aiohttp.ClientTimeout(total=20)
-
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, headers=headers, json=payload) as resp:
-                data = await resp.json(content_type=None)
-
-                if resp.status != 200:
-                    return f"خطا از GapGPT: {resp.status}"
-
-                reply = data["choices"][0]["message"]["content"].strip()
-                return reply[:250] if reply else "پاسخی نداد."
-    except Exception as e:
-        print(f"AI error: {e}")
-        return "خطا در ارتباط با هوش مصنوعی."
-
-
-# ---------- Highrise bot ----------
 class Bot(BaseBot):
+    def __init__(self):
+        super().__init__()
+        self.histories = defaultdict(lambda: deque(maxlen=8))
+        self.session = aiohttp.ClientSession()
+        self.ai_url = "https://api.gapgpt.app/v1/chat/completions"
+        self.ai_model = "gpt-4o"
+
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot started")
 
     async def on_user_join(self, user: User, position) -> None:
         await self.highrise.chat(f"سلام {user.username} 👋")
 
+    async def ask_gapgpt(self, user_id: str, username: str, text: str) -> str:
+        api_key = os.environ.get("AI_API_KEY", "").strip()
+        if not api_key:
+            return "AI_API_KEY تنظیم نشده."
+
+        history = list(self.histories[user_id])
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "تو یک بات فارسی برای Highrise هستی. "
+                    "طبیعی، کوتاه، صمیمی و مثل چت واقعی جواب بده. "
+                    "زیادی رسمی نباش. اگر لازم بود خیلی کوتاه شوخی هم بکن."
+                ),
+            }
+        ]
+
+        for item in history:
+            messages.append(item)
+
+        messages.append({"role": "user", "content": f"{username}: {text}"})
+
+        payload = {
+            "model": self.ai_model,
+            "messages": messages,
+            "temperature": 0.8,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        timeout = aiohttp.ClientTimeout(total=25)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self.ai_url, headers=headers, json=payload) as resp:
+                    data = await resp.json(content_type=None)
+
+                    if resp.status != 200:
+                        print("GapGPT error:", resp.status, data)
+                        return "فعلاً نتونستم جواب بدم."
+
+                    reply = (
+                        data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                        .strip()
+                    )
+
+                    if not reply:
+                        return "جوابی نگرفتم."
+
+                    self.histories[user_id].append({"role": "user", "content": f"{username}: {text}"})
+                    self.histories[user_id].append({"role": "assistant", "content": reply})
+
+                    return reply[:250]
+
+        except Exception as e:
+            print("AI request error:", e)
+            return "مشکل در ارتباط با هوش مصنوعی."
+
     async def on_chat(self, user: User, message: str) -> None:
         text = message.strip()
 
-        if text == "!ping":
-            await self.highrise.chat("pong 🏓")
+        if not text:
             return
 
-        if text == "!سلام":
-            reply = await ask_ai("به فارسی و خیلی کوتاه جواب بده: سلام!")
-            await self.highrise.chat(reply)
+        if text.startswith("!"):
+            cmd = text.lower()
+
+            if cmd == "!ping":
+                await self.highrise.chat("pong 🏓")
+                return
+
+            if cmd == "!clear":
+                self.histories.pop(user.id, None)
+                await self.highrise.chat(f"@{user.username} حافظه پاک شد ✅")
+                return
+
+            # هر دستور دیگری را فعلاً نادیده می‌گیریم
             return
+
+        reply = await self.ask_gapgpt(str(user.id), user.username, text)
+        await self.highrise.chat(reply)
 
 
 if __name__ == "__main__":
