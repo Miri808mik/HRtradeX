@@ -86,6 +86,11 @@ class Bot(BaseBot):
         self.daily_usage = {}
         self._keepalive_task = None
 
+        # قفل حرکت: وقتی True باشه بات هیچ‌جا نمی‌ره
+        self.movement_locked = False
+        # کاربری که الان بات داره براش میره (برای جلوگیری از تداخل چند درخواست هم‌زمان)
+        self.busy_with_username = None
+
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot started")
         self.owner_id = session_metadata.room_info.owner_id
@@ -116,39 +121,58 @@ class Bot(BaseBot):
             except Exception as e:
                 print(f"Keepalive ping failed: {e}")
 
-    # ---------- @بیا : فقط مالک، اومدن کنار کاربر ----------
-    async def come_to_user(self, requester: User) -> None:
-        result = await self.highrise.get_room_users()
-
-        if isinstance(result, Error):
-            print(f"get_room_users Error: {result.message}")
-            await self.highrise.chat(f"@{requester.username} نتونستم موقعیتت رو پیدا کنم.")
+    # ---------- اومدن کنار یه کاربر (برای @بیا و !سلام هر دو) ----------
+    async def go_greet_user(self, requester: User, say_after: str) -> None:
+        # شرط ۱: اگه بات قفله، اصلاً حرکت نکن
+        if self.movement_locked:
+            await self.highrise.chat(f"@{requester.username} الان قفلم، نمی‌تونم راه برم 🔒")
             return
 
-        target_position = None
-        for u, pos in result.content:
-            if u.id == requester.id:
-                target_position = pos
-                break
-
-        if target_position is None:
-            await self.highrise.chat(f"@{requester.username} پیدات نکردم توی اتاق.")
+        # شرط ۲: اگه بات همین الان داره برای یکی دیگه میره، صبر کن
+        if self.busy_with_username and self.busy_with_username != requester.username:
+            await self.highrise.chat(
+                f"@{requester.username} صبر کن، الان دارم میرم پیش {self.busy_with_username} 🙏"
+            )
             return
 
-        if isinstance(target_position, AnchorPosition):
-            # کاربر روی یه صندلی/آنکر نشسته؛ walk_to مستقیماً همین AnchorPosition رو هم قبول می‌کنه
-            pass
-
+        self.busy_with_username = requester.username
         try:
-            await self.highrise.walk_to(target_position)
-        except Exception as e:
-            print(f"walk_to error: {e}")
-            await self.highrise.chat(f"@{requester.username} پیدات کردم ولی نتونستم بیام کنارت.")
-            return
+            result = await self.highrise.get_room_users()
 
-        await self.highrise.chat(
-            f"اومدم پیشت {requester.username} 👋 | یوزرنیم: {requester.username} | آیدی: {requester.id}"
-        )
+            if isinstance(result, Error):
+                print(f"get_room_users Error: {result.message}")
+                await self.highrise.chat(f"@{requester.username} نتونستم موقعیتت رو پیدا کنم.")
+                return
+
+            target_position = None
+            for u, pos in result.content:
+                if u.id == requester.id:
+                    target_position = pos
+                    break
+
+            if target_position is None:
+                await self.highrise.chat(f"@{requester.username} پیدات نکردم توی اتاق.")
+                return
+
+            # شرط ۳: دقیقاً روی کاربر نایست، یه کم کنارش (اگه Position عادی بود)
+            if isinstance(target_position, Position):
+                target_position = Position(
+                    x=target_position.x + 1.0,
+                    y=target_position.y,
+                    z=target_position.z,
+                    facing=target_position.facing,
+                )
+
+            try:
+                await self.highrise.walk_to(target_position)
+            except Exception as e:
+                print(f"walk_to error: {e}")
+                await self.highrise.chat(f"@{requester.username} پیدات کردم ولی نتونستم بیام کنارت.")
+                return
+
+            await self.highrise.chat(f"@{requester.username} {say_after}")
+        finally:
+            self.busy_with_username = None
 
     def check_and_use_quota(self, user_id: str) -> bool:
         today = date.today().isoformat()
@@ -224,7 +248,24 @@ class Bot(BaseBot):
             if not self.is_owner(user):
                 await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
                 return
-            await self.come_to_user(user)
+            await self.go_greet_user(user, f"سلام {user.username} 👋 | آیدی: {user.id}")
+            return
+
+        # --- @قفل / @باز : فقط مالک، قفل‌کردن حرکت بات ---
+        if text in {"@قفل", "@lock"}:
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            self.movement_locked = True
+            await self.highrise.chat("بات قفل شد 🔒 دیگه راه نمیرم.")
+            return
+
+        if text in {"@باز", "@unlock"}:
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            self.movement_locked = False
+            await self.highrise.chat("بات باز شد 🔓 دوباره می‌تونم راه برم.")
             return
 
         # --- /emote_id مستقیم ---
@@ -263,6 +304,11 @@ class Bot(BaseBot):
         if lower == "clear":
             self.histories.pop(str(user.id), None)
             await self.highrise.chat(f"@{user.username} حافظه پاک شد ✅")
+            return
+
+        # --- !سلام (یا مشابهش) : بات میره کنار هر کسی که این‌رو بگه ---
+        if lower in {"سلام", "hi", "hello", "سلام بات", "سلام رفیق"}:
+            await self.go_greet_user(user, "سلام! 👋")
             return
 
         if lower == "quota":
