@@ -11,7 +11,7 @@ from collections import defaultdict, deque
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
-from highrise import BaseBot, SessionMetadata, User, Position
+from highrise import BaseBot, SessionMetadata, User, Position, AnchorPosition, Error
 
 
 class SimpleHandler(BaseHTTPRequestHandler):
@@ -118,58 +118,29 @@ class Bot(BaseBot):
 
     # ---------- @بیا : فقط مالک، اومدن کنار کاربر ----------
     async def come_to_user(self, requester: User) -> None:
-        try:
-            room_users = await self.highrise.get_room_users()
-        except Exception as e:
-            print(f"get_room_users error: {e}")
+        result = await self.highrise.get_room_users()
+
+        if isinstance(result, Error):
+            print(f"get_room_users Error: {result.message}")
             await self.highrise.chat(f"@{requester.username} نتونستم موقعیتت رو پیدا کنم.")
             return
 
-        print(f"DEBUG room_users type: {type(room_users)}")
-        if room_users:
-            print(f"DEBUG first item: {room_users[0]!r}")
+        target_position = None
+        for u, pos in result.content:
+            if u.id == requester.id:
+                target_position = pos
+                break
 
-        raw_position = None
-        try:
-            for item in room_users:
-                if isinstance(item, (tuple, list)) and len(item) == 2:
-                    u, pos = item
-                elif hasattr(item, "user") and hasattr(item, "position"):
-                    u, pos = item.user, item.position
-                else:
-                    u, pos = None, None
-                if u is not None and getattr(u, "id", None) == requester.id:
-                    raw_position = pos
-                    break
-        except Exception as e:
-            print(f"parsing room_users error: {e}")
-
-        if raw_position is None:
+        if target_position is None:
             await self.highrise.chat(f"@{requester.username} پیدات نکردم توی اتاق.")
             return
 
-        # اگه از قبل یه شیء Position معتبر بود همونو نگه دار، وگرنه از x/y/z بسازش
-        if isinstance(raw_position, Position):
-            target = raw_position
-        else:
-            try:
-                x = getattr(raw_position, "x", None)
-                y = getattr(raw_position, "y", None)
-                z = getattr(raw_position, "z", None)
-                facing = getattr(raw_position, "facing", "FrontRight")
-                if x is None and isinstance(raw_position, dict):
-                    x, y, z = raw_position.get("x"), raw_position.get("y"), raw_position.get("z")
-                    facing = raw_position.get("facing", "FrontRight")
-                target = Position(x=x, y=y, z=z, facing=facing)
-            except Exception as e:
-                print(f"Position build error: {e}")
-                await self.highrise.chat(f"@{requester.username} فرمت موقعیتت رو نتونستم بخونم.")
-                return
-
-        print(f"DEBUG target position: {target!r}")
+        if isinstance(target_position, AnchorPosition):
+            # کاربر روی یه صندلی/آنکر نشسته؛ walk_to مستقیماً همین AnchorPosition رو هم قبول می‌کنه
+            pass
 
         try:
-            await self.highrise.walk_to(target)
+            await self.highrise.walk_to(target_position)
         except Exception as e:
             print(f"walk_to error: {e}")
             await self.highrise.chat(f"@{requester.username} پیدات کردم ولی نتونستم بیام کنارت.")
