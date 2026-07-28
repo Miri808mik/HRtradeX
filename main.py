@@ -193,7 +193,8 @@ class Bot(BaseBot):
         self.daily_usage[user_id] = (today, count + 1)
         return True
 
-    async def ask_gapgpt(self, user_id: str, username: str, text: str) -> str:        api_key = os.environ.get("AI_API_KEY", "").strip()
+    async def ask_gapgpt(self, user_id: str, username: str, text: str) -> str:
+        api_key = os.environ.get("AI_API_KEY", "").strip()
         if not api_key:
             return "AI_API_KEY تنظیم نشده."
 
