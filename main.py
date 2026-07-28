@@ -1,14 +1,17 @@
 import os
+import re
+import random
 import threading
 import subprocess
 import sys
+import asyncio
 from datetime import date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict, deque
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
-from highrise import BaseBot, SessionMetadata, User
+from highrise import BaseBot, SessionMetadata, User, Position
 
 
 class SimpleHandler(BaseHTTPRequestHandler):
@@ -25,6 +28,9 @@ def run_fake_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), SimpleHandler)
     server.serve_forever()
+
+
+HIGHRS_LINK_RE = re.compile(r"(https?://(?:www\.)?high\.rs/\S+)")
 
 
 def extract_emote_id(raw_value: str):
@@ -45,10 +51,29 @@ def extract_emote_id(raw_value: str):
     return value
 
 
-# یوزرنیم‌هایی که همیشه "مالک" شناخته میشن (حروف کوچیک)
-EXTRA_OWNER_USERNAMES = {"syntaxerror.py"}
+def find_dance_in_text(text: str):
+    """دنبال لینک high.rs یا آیدی خام (مثل dance-xxx) هر جای متن می‌گرده، حتی وسط یه جمله."""
+    match = HIGHRS_LINK_RE.search(text)
+    if match:
+        return extract_emote_id(match.group(1))
+    # آیدی خام بدون فاصله که با dance- یا emote- یا idle- شروع بشه
+    bare_match = re.search(r"\b(dance-[\w-]+|emote-[\w-]+|idle-[\w-]+)\b", text)
+    if bare_match:
+        return bare_match.group(1)
+    return None
 
+
+DANCE_REPLIES = [
+    "بیا اینم دنست 💃",
+    "اینم رقصی که خواستی ✨",
+    "بفرما، اجرا شد 🕺",
+]
+
+EXTRA_OWNER_USERNAMES = {"syntaxerror.py"}
 DAILY_AI_LIMIT = 20
+
+# آدرس عمومی سرویس روی Render، برای بیدار نگه‌داشتنش
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://hrtradex.onrender.com")
 
 
 class Bot(BaseBot):
@@ -59,24 +84,100 @@ class Bot(BaseBot):
         self.histories = defaultdict(lambda: deque(maxlen=8))
         self.owner_id = None
         self.daily_usage = {}
-
-        # سیستم دنس: user_id -> emote_id فعلی
-        self.user_dance_states = {}
+        self._keepalive_task = None
 
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot started")
         self.owner_id = session_metadata.room_info.owner_id
+        if self._keepalive_task is None:
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
     async def on_user_join(self, user: User, position) -> None:
         await self.highrise.chat(f"سلام {user.username} 👋")
-
-    async def on_user_leave(self, user: User) -> None:
-        await self._stop_user_dance(user.id)
 
     def is_owner(self, user: User) -> bool:
         if self.owner_id and user.id == self.owner_id:
             return True
         return user.username.lower() in EXTRA_OWNER_USERNAMES
+
+    # ---------- بیدار نگه‌داشتن Render (پلن رایگان) ----------
+    async def _keepalive_loop(self) -> None:
+        # منتظر می‌مونیم بات کامل بالا بیاد
+        await asyncio.sleep(30)
+        while True:
+            # فاصله‌ی تصادفی بین ۶ تا ۱۲ دقیقه، تا همیشه یه عدد ثابت نباشه
+            wait_seconds = random.randint(6 * 60, 12 * 60)
+            await asyncio.sleep(wait_seconds)
+            try:
+                timeout = aiohttp.ClientTimeout(total=15)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(PUBLIC_URL) as resp:
+                        print(f"Keepalive ping: status={resp.status}")
+            except Exception as e:
+                print(f"Keepalive ping failed: {e}")
+
+    # ---------- @بیا : فقط مالک، اومدن کنار کاربر ----------
+    async def come_to_user(self, requester: User) -> None:
+        try:
+            room_users = await self.highrise.get_room_users()
+        except Exception as e:
+            print(f"get_room_users error: {e}")
+            await self.highrise.chat(f"@{requester.username} نتونستم موقعیتت رو پیدا کنم.")
+            return
+
+        print(f"DEBUG room_users type: {type(room_users)}")
+        if room_users:
+            print(f"DEBUG first item: {room_users[0]!r}")
+
+        raw_position = None
+        try:
+            for item in room_users:
+                if isinstance(item, (tuple, list)) and len(item) == 2:
+                    u, pos = item
+                elif hasattr(item, "user") and hasattr(item, "position"):
+                    u, pos = item.user, item.position
+                else:
+                    u, pos = None, None
+                if u is not None and getattr(u, "id", None) == requester.id:
+                    raw_position = pos
+                    break
+        except Exception as e:
+            print(f"parsing room_users error: {e}")
+
+        if raw_position is None:
+            await self.highrise.chat(f"@{requester.username} پیدات نکردم توی اتاق.")
+            return
+
+        # اگه از قبل یه شیء Position معتبر بود همونو نگه دار، وگرنه از x/y/z بسازش
+        if isinstance(raw_position, Position):
+            target = raw_position
+        else:
+            try:
+                x = getattr(raw_position, "x", None)
+                y = getattr(raw_position, "y", None)
+                z = getattr(raw_position, "z", None)
+                facing = getattr(raw_position, "facing", "FrontRight")
+                if x is None and isinstance(raw_position, dict):
+                    x, y, z = raw_position.get("x"), raw_position.get("y"), raw_position.get("z")
+                    facing = raw_position.get("facing", "FrontRight")
+                target = Position(x=x, y=y, z=z, facing=facing)
+            except Exception as e:
+                print(f"Position build error: {e}")
+                await self.highrise.chat(f"@{requester.username} فرمت موقعیتت رو نتونستم بخونم.")
+                return
+
+        print(f"DEBUG target position: {target!r}")
+
+        try:
+            await self.highrise.walk_to(target)
+        except Exception as e:
+            print(f"walk_to error: {e}")
+            await self.highrise.chat(f"@{requester.username} پیدات کردم ولی نتونستم بیام کنارت.")
+            return
+
+        await self.highrise.chat(
+            f"اومدم پیشت {requester.username} 👋 | یوزرنیم: {requester.username} | آیدی: {requester.id}"
+        )
 
     def check_and_use_quota(self, user_id: str) -> bool:
         today = date.today().isoformat()
@@ -89,66 +190,6 @@ class Bot(BaseBot):
         self.daily_usage[user_id] = (today, count + 1)
         return True
 
-    # ---------- سیستم دنس ----------
-    async def _stop_user_dance(self, user_id) -> bool:
-        had_active = user_id in self.user_dance_states
-        self.user_dance_states.pop(user_id, None)
-        if had_active:
-            # یه ایموت کوتاه و خنثی می‌فرستیم تا لوپ رقص فعلی رو قطع کنه
-            try:
-                await self.highrise.send_emote("emote-hello", user_id)
-            except Exception as e:
-                print(f"Stop emote error: {e}")
-        return had_active
-
-    # ---------- @بیا : اومدن کنار کاربر ----------
-    async def come_to_user(self, requester: User) -> None:
-        try:
-            room_users = await self.highrise.get_room_users()
-        except Exception as e:
-            print(f"get_room_users error: {e}")
-            await self.highrise.chat(f"@{requester.username} نتونستم موقعیتت رو پیدا کنم.")
-            return
-
-        # دیباگ: دقیقاً ببینیم SDK چه فرمتی برمی‌گردونه
-        print(f"DEBUG room_users type: {type(room_users)}")
-        if room_users:
-            print(f"DEBUG first item: {room_users[0]!r}")
-
-        target_position = None
-        try:
-            for item in room_users:
-                # حالت ۱: تاپل (User, Position)
-                if isinstance(item, (tuple, list)) and len(item) == 2:
-                    u, pos = item
-                # حالت ۲: آبجکتی با .user و .position
-                elif hasattr(item, "user") and hasattr(item, "position"):
-                    u, pos = item.user, item.position
-                else:
-                    u, pos = None, None
-
-                if u is not None and getattr(u, "id", None) == requester.id:
-                    target_position = pos
-                    break
-        except Exception as e:
-            print(f"parsing room_users error: {e}")
-
-        if target_position is None:
-            await self.highrise.chat(f"@{requester.username} پیدات نکردم توی اتاق (شاید بات نسخه‌ی این متد رو پشتیبانی نکنه).")
-            return
-
-        try:
-            await self.highrise.walk_to(target_position)
-        except Exception as e:
-            print(f"walk_to error: {e}")
-            await self.highrise.chat(f"@{requester.username} پیدات کردم ولی نتونستم بیام کنارت.")
-            return
-
-        await self.highrise.chat(
-            f"اومدم پیشت {requester.username} 👋 | یوزرنیم: {requester.username} | آیدی: {requester.id}"
-        )
-
-    # ---------- AI ----------
     async def ask_gapgpt(self, user_id: str, username: str, text: str) -> str:
         api_key = os.environ.get("AI_API_KEY", "").strip()
         if not api_key:
@@ -202,41 +243,39 @@ class Bot(BaseBot):
             print("AI request error:", e)
             return "مشکل در ارتباط با هوش مصنوعی."
 
-    # ---------- چت اصلی ----------
     async def on_chat(self, user: User, message: str) -> None:
         text = message.strip()
         if not text:
             return
 
-        # --- @بیا ---
+        # --- @بیا : فقط مالک ---
         if text in {"@بیا", "@come", "@بیا اینجا"}:
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
             await self.come_to_user(user)
             return
 
-        # --- /emote_id یا لینک دنس : اجرای دنس تکرارشونده ---
+        # --- /emote_id مستقیم ---
         if text.startswith("/"):
             payload = text[1:].strip()
             if payload.lower() in {"stop", "استوپ", "متوقف"}:
-                stopped = await self._stop_user_dance(user.id)
-                await self.highrise.chat(
-                    f"@{user.username} دنس متوقف شد ✅" if stopped else f"@{user.username} دنس فعالی نداری"
-                )
+                try:
+                    await self.highrise.send_emote("emote-hello", user.id)
+                    await self.highrise.chat(f"@{user.username} دنس متوقف شد ✅")
+                except Exception as e:
+                    print(f"Stop error: {e}")
                 return
-
             emote_id = extract_emote_id(payload)
             if not emote_id:
-                await self.highrise.chat(f"@{user.username} فرمت دنس معتبر نیست. مثال: /dance-macarena یا لینک high.rs")
+                await self.highrise.chat(f"@{user.username} فرمت دنس معتبر نیست.")
                 return
-
             try:
                 await self.highrise.send_emote(emote_id, user.id)
+                await self.highrise.chat(f"@{user.username} دنس شروع شد 💃 (توقف: /stop)")
             except Exception as e:
-                print(f"Dance start error: {e}")
-                await self.highrise.chat(f"@{user.username} این دنس اجرا نشد، آیدیش رو چک کن.")
-                return
-
-            self.user_dance_states[user.id] = emote_id
-            await self.highrise.chat(f"@{user.username} دنس شروع شد 💃 (برای توقف بنویس: /stop)")
+                print(f"Dance error: {e}")
+                await self.highrise.chat(f"@{user.username} این دنس اجرا نشد.")
             return
 
         # --- بقیه فقط با ! ---
@@ -256,6 +295,9 @@ class Bot(BaseBot):
             return
 
         if lower == "quota":
+            if self.is_owner(user):
+                await self.highrise.chat(f"@{user.username} تو مالکی، محدودیت نداری 👑")
+                return
             today = date.today().isoformat()
             used_date, count = self.daily_usage.get(str(user.id), (today, 0))
             remaining = DAILY_AI_LIMIT - (count if used_date == today else 0)
@@ -265,9 +307,22 @@ class Bot(BaseBot):
         if not payload:
             return
 
-        if not self.check_and_use_quota(str(user.id)):
-            await self.highrise.chat(f"@{user.username} سهمیه‌ی امروزت ({DAILY_AI_LIMIT} پیام) تموم شده، فردا دوباره امتحان کن.")
+        # --- تشخیص خودکار دنس داخل جمله (بدون نیاز به AI) ---
+        dance_id = find_dance_in_text(payload)
+        if dance_id:
+            try:
+                await self.highrise.send_emote(dance_id, user.id)
+                await self.highrise.chat(f"@{user.username} " + random.choice(DANCE_REPLIES))
+            except Exception as e:
+                print(f"Inline dance error: {e}")
+                await self.highrise.chat(f"@{user.username} این دنس اجرا نشد.")
             return
+
+        # --- محدودیت روزانه (مالک محدودیت نداره) ---
+        if not self.is_owner(user):
+            if not self.check_and_use_quota(str(user.id)):
+                await self.highrise.chat(f"@{user.username} سهمیه‌ی امروزت ({DAILY_AI_LIMIT} پیام) تموم شده، فردا دوباره امتحان کن.")
+                return
 
         reply = await self.ask_gapgpt(str(user.id), user.username, payload)
         await self.highrise.chat(reply)
