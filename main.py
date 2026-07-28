@@ -28,10 +28,9 @@ def run_fake_server():
 class Bot(BaseBot):
     def __init__(self):
         super().__init__()
-        self.histories = defaultdict(lambda: deque(maxlen=8))
-        self.session = aiohttp.ClientSession()
         self.ai_url = "https://api.gapgpt.app/v1/chat/completions"
         self.ai_model = "gpt-4o"
+        self.histories = defaultdict(lambda: deque(maxlen=8))
 
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot started")
@@ -44,20 +43,18 @@ class Bot(BaseBot):
         if not api_key:
             return "AI_API_KEY تنظیم نشده."
 
-        history = list(self.histories[user_id])
-
         messages = [
             {
                 "role": "system",
                 "content": (
                     "تو یک بات فارسی برای Highrise هستی. "
                     "طبیعی، کوتاه، صمیمی و مثل چت واقعی جواب بده. "
-                    "زیادی رسمی نباش. اگر لازم بود خیلی کوتاه شوخی هم بکن."
+                    "جواب‌ها کوتاه و غیرتکراری باشند."
                 ),
             }
         ]
 
-        for item in history:
+        for item in self.histories[user_id]:
             messages.append(item)
 
         messages.append({"role": "user", "content": f"{username}: {text}"})
@@ -117,11 +114,10 @@ class Bot(BaseBot):
                 return
 
             if cmd == "!clear":
-                self.histories.pop(user.id, None)
+                self.histories.pop(str(user.id), None)
                 await self.highrise.chat(f"@{user.username} حافظه پاک شد ✅")
                 return
 
-            # هر دستور دیگری را فعلاً نادیده می‌گیریم
             return
 
         reply = await self.ask_gapgpt(str(user.id), user.username, text)
