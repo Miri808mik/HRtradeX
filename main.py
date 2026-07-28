@@ -63,6 +63,14 @@ def find_dance_in_text(text: str):
     return None
 
 
+# تشخیص نیت «بیا اینجا/کنارم/پیشم» با کلمه‌کلیدی، نه با AI (سریع‌تر و بدون هزینه)
+COME_HERE_RE = re.compile(r"بیا(ی|ید)?\b")
+
+
+def is_come_here_request(text: str) -> bool:
+    return bool(COME_HERE_RE.search(text))
+
+
 DANCE_REPLIES = [
     "بیا اینم دنست 💃",
     "اینم رقصی که خواستی ✨",
@@ -185,8 +193,7 @@ class Bot(BaseBot):
         self.daily_usage[user_id] = (today, count + 1)
         return True
 
-    async def ask_gapgpt(self, user_id: str, username: str, text: str) -> str:
-        api_key = os.environ.get("AI_API_KEY", "").strip()
+    async def ask_gapgpt(self, user_id: str, username: str, text: str) -> str:        api_key = os.environ.get("AI_API_KEY", "").strip()
         if not api_key:
             return "AI_API_KEY تنظیم نشده."
 
@@ -237,6 +244,54 @@ class Bot(BaseBot):
         except Exception as e:
             print("AI request error:", e)
             return "مشکل در ارتباط با هوش مصنوعی."
+
+    async def ask_come_reply(self, username: str, original_message: str) -> str:
+        """یه جمله‌ی کوتاه و طبیعی تولید می‌کنه، انگار بات داره میاد سمت کاربر."""
+        api_key = os.environ.get("AI_API_KEY", "").strip()
+        if not api_key:
+            return "دارم میام! 🏃"
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "یه بات فارسیِ Highrise هستی که الان داره به سمت یه کاربر راه میره چون صداش زده. "
+                    "فقط یه جمله‌ی خیلی کوتاه (حداکثر ۱۰ کلمه) و طبیعی بگو که داری میای، "
+                    "و اگه کاربر دلیلی برای صدا زدن گفته (مثلاً 'کارت دارم')، ازش بپرس چیکار داره. "
+                    "بدون توضیح اضافه، فقط همون یه جمله."
+                ),
+            },
+            {"role": "user", "content": f"{username} گفت: {original_message}"},
+        ]
+        payload = {
+            "model": self.ai_model,
+            "messages": messages,
+            "temperature": 0.9,
+            "max_tokens": 60,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self.ai_url, headers=headers, json=payload) as resp:
+                    data = await resp.json(content_type=None)
+                    if resp.status != 200:
+                        print("GapGPT come-reply error:", resp.status, data)
+                        return "دارم میام! 🏃"
+                    reply = (
+                        data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                        .strip()
+                    )
+                    return reply[:100] if reply else "دارم میام! 🏃"
+        except Exception as e:
+            print("AI come-reply error:", e)
+            return "دارم میام! 🏃"
 
     async def on_chat(self, user: User, message: str) -> None:
         text = message.strip()
@@ -306,9 +361,10 @@ class Bot(BaseBot):
             await self.highrise.chat(f"@{user.username} حافظه پاک شد ✅")
             return
 
-        # --- !سلام (یا مشابهش) : بات میره کنار هر کسی که این‌رو بگه ---
-        if lower in {"سلام", "hi", "hello", "سلام بات", "سلام رفیق"}:
-            await self.go_greet_user(user, "سلام! 👋")
+        # --- تشخیص نیت «بیا اینجا/کنارم/پیشم» : بات میره کنار هر کسی که این‌رو بگه ---
+        if is_come_here_request(payload):
+            reply_text = await self.ask_come_reply(user.username, payload)
+            await self.go_greet_user(user, reply_text)
             return
 
         if lower == "quota":
