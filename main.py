@@ -81,6 +81,25 @@ DANCE_REPLIES = [
 EXTRA_OWNER_USERNAMES = {"syntaxerror.py"}
 DAILY_AI_LIMIT = 20
 
+# --- تشخیص دعوای واقعی ---
+# یه لیست پایه و ساده، فقط برای اینکه بفهمیم کِی ارزش داره از AI بپرسیم «این شوخیه یا جدی؟»
+# (لازم نیست کامل باشه، فقط باید رایج‌ترین کلمات رکیک رو بگیره)
+ROUGH_WORD_PATTERN = re.compile(
+    r"(کص|کیر|جنده|عوضی|حرومزاده|حروم\s*زاده|آشغال|کثافت|لاشی|احمق|خفه\s*شو)"
+)
+
+HOSTILITY_WINDOW_SECONDS = 5 * 60   # ۵ دقیقه
+HOSTILITY_THRESHOLD = 3             # چندبار پیام «جدیِ» توهین‌آمیز لازمه تا میوت بشه
+MUTE_SECONDS = 2 * 60 * 60          # ۲ ساعت (واحد action_length رو مطمئن نیستیم، احتمالاً ثانیه‌ست)
+
+# --- رفتار وقتی بیکاره ---
+IDLE_CHECK_INTERVAL = (120, 240)    # هر ۲ تا ۴ دقیقه یه‌بار چک کن کسی تنها هست یا نه
+LONELY_RESPONSE_TIMEOUT = 150       # ۲.۵ دقیقه صبر کن ببین جواب میده یا نه
+
+# --- اولویت بین دو نفر ---
+ACTIVE_CONVO_WINDOW = 120           # اگه ظرف ۲ دقیقه‌ی اخیر باهاش حرف زده بودیم، یعنی "مشغولیم"
+NUDGE_TIMEOUT = 15                  # چقدر صبر کنیم ببینیم نفر اول اعتراض می‌کنه یا نه
+
 # برای فهمیدن «کی نزدیک کیه»: شعاع (واحد مختصات Highrise) و بازه‌ی زمانی که پیام‌ها معتبرن
 # این عدد حدسیه، چون Highrise مقیاس دقیق فاصله رو مستند نکرده - نیاز به تست و تنظیم داره
 NEARBY_RADIUS = 5.0
@@ -110,11 +129,87 @@ class Bot(BaseBot):
         # هر آیتم: (timestamp, user_id, username, text)
         self.chat_log = deque(maxlen=300)
 
+        # @خاموش / @روشن
+        self.is_shutdown = False
+
+        # تشخیص دعوای واقعی: user_id -> لیست timestamp پیام‌های جدیِ توهین‌آمیز
+        self.hostility_log = defaultdict(list)
+
+        # گشت‌زدن وقتی بیکاره
+        self._idle_wander_task = None
+        self.pending_lonely_user_id = None
+        self.recently_greeted_ids = deque(maxlen=10)
+
+        # مکالمه‌ی فعال با AI: (user_id, username, آخرین timestamp)
+        self.current_ai_partner = None
+
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot started")
         self.owner_id = session_metadata.room_info.owner_id
         if self._keepalive_task is None:
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        if self._idle_wander_task is None:
+            self._idle_wander_task = asyncio.create_task(self._idle_wander_loop())
+
+    async def _idle_wander_loop(self) -> None:
+        await asyncio.sleep(60)
+        while True:
+            wait_seconds = random.randint(*IDLE_CHECK_INTERVAL)
+            await asyncio.sleep(wait_seconds)
+
+            if self.is_shutdown or self.movement_locked or self.busy_with_username:
+                continue
+            if self.pending_lonely_user_id is not None:
+                continue  # هنوز منتظر جواب یه نفریم
+
+            try:
+                result = await self.highrise.get_room_users()
+            except Exception as e:
+                print(f"idle wander get_room_users error: {e}")
+                continue
+            if isinstance(result, Error):
+                continue
+
+            positions = [(u, pos) for u, pos in result.content if isinstance(pos, Position)]
+            if len(positions) < 1:
+                continue
+
+            # برای هر کاربر، نزدیک‌ترین فاصله تا بقیه رو حساب کن؛ تنهاترین یعنی بیشترین "نزدیک‌ترین فاصله"
+            def min_dist(target_u, target_pos, others):
+                dists = [
+                    ((op.x - target_pos.x) ** 2 + (op.z - target_pos.z) ** 2) ** 0.5
+                    for ou, op in others if ou.id != target_u.id
+                ]
+                return min(dists) if dists else float("inf")
+
+            candidates = []
+            for target_u, target_pos in positions:
+                if target_u.id in self.recently_greeted_ids:
+                    continue
+                d = min_dist(target_u, target_pos, positions)
+                if d >= NEARBY_RADIUS:
+                    candidates.append((d, target_u))
+
+            if not candidates:
+                continue
+
+            candidates.sort(key=lambda item: -item[0])
+            lonely_user = candidates[0][1]
+
+            self.pending_lonely_user_id = lonely_user.id
+            self.recently_greeted_ids.append(lonely_user.id)
+
+            opener = random.choice([
+                "چرا تنها وایستادی؟ 😄",
+                "هووی، تنهایی؟ بیا حرف بزنیم",
+                "چیه غمگینی؟ 😅",
+            ])
+            await self.go_greet_user(lonely_user, opener)
+
+            # منتظر جواب بمون؛ اگه ظرف این مدت جواب نداد، بی‌خیال شو
+            await asyncio.sleep(LONELY_RESPONSE_TIMEOUT)
+            if self.pending_lonely_user_id == lonely_user.id:
+                self.pending_lonely_user_id = None
 
     async def on_user_join(self, user: User, position) -> None:
         await self.highrise.chat(f"سلام {user.username} 👋")
@@ -123,6 +218,74 @@ class Bot(BaseBot):
         if self.owner_id and user.id == self.owner_id:
             return True
         return user.username.lower() in EXTRA_OWNER_USERNAMES
+
+    # ---------- تشخیص دعوای واقعی از شوخی، و میوت‌کردن ----------
+    async def classify_hostility(self, text: str, context: str) -> bool:
+        """با AI تشخیص میده این پیام واقعاً توهین‌آمیز/دعواست یا شوخیِ دوستانه‌ست."""
+        api_key = os.environ.get("AI_API_KEY", "").strip()
+        if not api_key:
+            return False  # بدون AI، محافظه‌کارانه فرض می‌کنیم شوخیه
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "یه پیام رو با زمینه‌ی گفتگوی قبلش می‌بینی. باید تشخیص بدی این پیام "
+                    "واقعاً توهین/دعوای جدیه، یا شوخیِ دوستانه بین رفقاست (که فحش‌های شوخی هم توش عادیه). "
+                    "فقط با یه کلمه جواب بده: SERIOUS یا JOKE. هیچ توضیح اضافه نده."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"زمینه‌ی گفتگو:\n{context}\n\nپیام مورد بررسی: {text}",
+            },
+        ]
+        payload = {"model": self.ai_model, "messages": messages, "temperature": 0.0, "max_tokens": 5}
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self.ai_url, headers=headers, json=payload) as resp:
+                    data = await resp.json(content_type=None)
+                    reply = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip().upper()
+                    return "SERIOUS" in reply
+        except Exception as e:
+            print(f"Hostility classify error: {e}")
+            return False
+
+    async def handle_possible_hostility(self, user: User, text: str) -> None:
+        if not ROUGH_WORD_PATTERN.search(text):
+            return
+
+        context = await self.gather_nearby_context(user)
+        is_serious = await self.classify_hostility(text, context)
+        if not is_serious:
+            return  # شوخیه، بی‌خیال
+
+        now = time.time()
+        log = self.hostility_log[user.id]
+        log.append(now)
+        # فقط پیام‌های داخل بازه‌ی زمانی رو نگه دار
+        self.hostility_log[user.id] = [t for t in log if now - t <= HOSTILITY_WINDOW_SECONDS]
+
+        if len(self.hostility_log[user.id]) < HOSTILITY_THRESHOLD:
+            return
+
+        # سقف رد شد → میوت کن
+        self.hostility_log[user.id] = []
+        try:
+            await self.highrise.moderate_room(user.id, "mute", MUTE_SECONDS)
+        except Exception as e:
+            print(f"moderate_room error: {e}")
+            return
+
+        hours = MUTE_SECONDS // 3600
+        try:
+            await self.go_greet_user(
+                user, f"به‌خاطر توهین/دعوای مکرر، به مدت {hours} ساعت از صحبت‌کردن محدود شدی 🚫"
+            )
+        except Exception as e:
+            print(f"greet after mute error: {e}")
 
     # ---------- بیدار نگه‌داشتن Render (پلن رایگان) ----------
     async def _keepalive_loop(self) -> None:
@@ -252,9 +415,13 @@ class Bot(BaseBot):
             {
                 "role": "system",
                 "content": (
-                    "تو یک بات فارسی برای Highrise هستی. "
-                    "طبیعی، کوتاه، صمیمی و مثل چت واقعی جواب بده. "
-                    "جواب‌ها کوتاه و غیرتکراری باشند."
+                    "تو یه رفیق صمیمی توی روم Highrise هستی، نه یه بات رسمی. "
+                    "خیلی خیلی کوتاه جواب بده (یکی دو خط، مثل چت واقعی با دوست). "
+                    "لحنت باحال، خودمونی و بامزه باشه، نه رسمی و خشک. "
+                    "اگه بین دوستا شوخی، طعنه، یا فحش دوستانه رد و بدل میشه، جدیش نگیر و باهاشون همراهی/شوخی کن، "
+                    "اصلاً نصیحت نکن و نگو 'لطفاً محترمانه صحبت کنید' یا مشابهش — "
+                    "فقط وقتی واقعاً یه دعوای جدی و پر از توهین می‌بینی جدی برخورد کن (اونم نه با نصیحت، فقط با گزارش به تیم مدیریت که جدا هندل میشه). "
+                    "جواب‌ها غیرتکراری و طبیعی باشن."
                 ),
             }
         ]
@@ -276,8 +443,8 @@ class Bot(BaseBot):
         payload = {
             "model": self.ai_model,
             "messages": messages,
-            "temperature": 0.8,
-            "max_tokens": 300,
+            "temperature": 0.9,
+            "max_tokens": 120,
         }
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -306,6 +473,44 @@ class Bot(BaseBot):
         except Exception as e:
             print("AI request error:", e)
             return "مشکل در ارتباط با هوش مصنوعی."
+
+    async def handle_come_here_with_priority(self, requester: User, payload: str) -> None:
+        partner = self.current_ai_partner
+        now = time.time()
+
+        is_someone_else_active = (
+            partner is not None
+            and partner[0] != requester.id
+            and (now - partner[2]) <= ACTIVE_CONVO_WINDOW
+        )
+
+        if is_someone_else_active:
+            partner_id, partner_username, _ = partner
+            await self.highrise.chat(
+                f"@{partner_username} ببخشید، {requester.username} کارم داره؛ "
+                f"اگه کارت باهام تموم نشده بگو 'صبرکن' 🙏"
+            )
+
+            deadline = time.time() + NUDGE_TIMEOUT
+            objected = False
+            while time.time() < deadline:
+                await asyncio.sleep(1)
+                for ts, uid, uname, msg in reversed(self.chat_log):
+                    if ts < deadline - NUDGE_TIMEOUT:
+                        break
+                    if uid == partner_id and re.search(r"صبر|وایسا|وایستا", msg):
+                        objected = True
+                        break
+                if objected:
+                    break
+
+            if objected:
+                await self.highrise.chat(f"@{requester.username} یه لحظه صبر کن، {partner_username} هنوز کارم داره 🙏")
+                return
+
+        reply_text = await self.ask_come_reply(requester.username, payload)
+        await self.go_greet_user(requester, reply_text)
+        self.current_ai_partner = (requester.id, requester.username, time.time())
 
     async def ask_come_reply(self, username: str, original_message: str) -> str:
         """یه جمله‌ی کوتاه و طبیعی تولید می‌کنه، انگار بات داره میاد سمت کاربر."""
@@ -362,6 +567,34 @@ class Bot(BaseBot):
 
         # همه‌ی پیام‌ها (حتی بدون !) رو ثبت می‌کنیم تا بعداً بشه زمینه‌ی گفتگو رو فهمید
         self.chat_log.append((time.time(), user.id, user.username, text))
+
+        # --- @روشن : همیشه کار می‌کنه، حتی وقتی خاموشیم ---
+        if text in {"@روشن", "@on"}:
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            self.is_shutdown = False
+            await self.highrise.chat("روشن شدم ✅")
+            return
+
+        if self.is_shutdown:
+            return
+
+        # --- @خاموش : فقط مالک ---
+        if text in {"@خاموش", "@off"}:
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            await self.highrise.chat("باشه، خاموش میشم 🔌 (برای روشن‌کردن: @روشن)")
+            self.is_shutdown = True
+            return
+
+        # --- تشخیص دعوای واقعی، روی همه‌ی پیام‌ها (نه فقط با !) ---
+        await self.handle_possible_hostility(user, text)
+
+        # اگه کاربر پابندِ منتظرِ پاسخِ «تنها» بود، یعنی جواب داد → دیگه بات نره سراغ یکی دیگه
+        if self.pending_lonely_user_id == user.id:
+            self.pending_lonely_user_id = None
 
         # --- @بیا : فقط مالک ---
         if text in {"@بیا", "@come", "@بیا اینجا"}:
@@ -428,8 +661,7 @@ class Bot(BaseBot):
 
         # --- تشخیص نیت «بیا اینجا/کنارم/پیشم» : بات میره کنار هر کسی که این‌رو بگه ---
         if is_come_here_request(payload):
-            reply_text = await self.ask_come_reply(user.username, payload)
-            await self.go_greet_user(user, reply_text)
+            await self.handle_come_here_with_priority(user, payload)
             return
 
         if lower == "quota":
@@ -466,6 +698,7 @@ class Bot(BaseBot):
 
         reply = await self.ask_gapgpt(str(user.id), user.username, payload, context=nearby_context)
         await self.highrise.chat(reply)
+        self.current_ai_partner = (user.id, user.username, time.time())
 
 
 if __name__ == "__main__":
