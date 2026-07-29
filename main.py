@@ -81,16 +81,9 @@ DANCE_REPLIES = [
 EXTRA_OWNER_USERNAMES = {"syntaxerror.py"}
 DAILY_AI_LIMIT = 20
 
-# --- تشخیص دعوای واقعی ---
-# یه لیست پایه و ساده، فقط برای اینکه بفهمیم کِی ارزش داره از AI بپرسیم «این شوخیه یا جدی؟»
-# (لازم نیست کامل باشه، فقط باید رایج‌ترین کلمات رکیک رو بگیره)
-ROUGH_WORD_PATTERN = re.compile(
-    r"(کص|کیر|جنده|عوضی|حرومزاده|حروم\s*زاده|آشغال|کثافت|لاشی|احمق|خفه\s*شو)"
-)
-
-HOSTILITY_WINDOW_SECONDS = 5 * 60   # ۵ دقیقه
-HOSTILITY_THRESHOLD = 3             # چندبار پیام «جدیِ» توهین‌آمیز لازمه تا میوت بشه
-MUTE_SECONDS = 2 * 60 * 60          # ۲ ساعت (واحد action_length رو مطمئن نیستیم، احتمالاً ثانیه‌ست)
+# --- تشخیص دعوای واقعی (فقط وقتی کسی #گزارش بزنه، نه همیشه - برای صرفه‌جویی توکن) ---
+REPORT_WINDOW_SECONDS = 3 * 60       # ۳ دقیقه زیرنظر می‌گیره
+MUTE_SECONDS = 2 * 60 * 60           # ۲ ساعت (واحد action_length رو مطمئن نیستیم، احتمالاً ثانیه‌ست)
 
 # --- رفتار وقتی بیکاره ---
 IDLE_CHECK_INTERVAL = (120, 240)    # هر ۲ تا ۴ دقیقه یه‌بار چک کن کسی تنها هست یا نه
@@ -117,6 +110,7 @@ class Bot(BaseBot):
         self.ai_model = os.environ.get("AI_MODEL", "gpt-4.1")
         self.histories = defaultdict(lambda: deque(maxlen=8))
         self.owner_id = None
+        self.own_user_id = None
         self.daily_usage = {}
         self._keepalive_task = None
 
@@ -132,8 +126,8 @@ class Bot(BaseBot):
         # @خاموش / @روشن
         self.is_shutdown = False
 
-        # تشخیص دعوای واقعی: user_id -> لیست timestamp پیام‌های جدیِ توهین‌آمیز
-        self.hostility_log = defaultdict(list)
+        # حالت گزارش: وقتی #گزارش گفته میشه، تا این timestamp چت رو زیر نظر می‌گیره
+        self.report_monitoring_until = None
 
         # گشت‌زدن وقتی بیکاره
         self._idle_wander_task = None
@@ -146,6 +140,7 @@ class Bot(BaseBot):
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot started")
         self.owner_id = session_metadata.room_info.owner_id
+        self.own_user_id = session_metadata.user_id
         if self._keepalive_task is None:
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         if self._idle_wander_task is None:
@@ -170,7 +165,10 @@ class Bot(BaseBot):
             if isinstance(result, Error):
                 continue
 
-            positions = [(u, pos) for u, pos in result.content if isinstance(pos, Position)]
+            positions = [
+                (u, pos) for u, pos in result.content
+                if isinstance(pos, Position) and u.id != self.own_user_id
+            ]
             if len(positions) < 1:
                 continue
 
@@ -219,73 +217,87 @@ class Bot(BaseBot):
             return True
         return user.username.lower() in EXTRA_OWNER_USERNAMES
 
-    # ---------- تشخیص دعوای واقعی از شوخی، و میوت‌کردن ----------
-    async def classify_hostility(self, text: str, context: str) -> bool:
-        """با AI تشخیص میده این پیام واقعاً توهین‌آمیز/دعواست یا شوخیِ دوستانه‌ست."""
+    # ---------- حالت گزارش: با #گزارش فعال میشه، چند دقیقه چت رو زیرنظر می‌گیره ----------
+    async def start_report_monitoring(self, requester: User) -> None:
+        if self.report_monitoring_until and time.time() < self.report_monitoring_until:
+            await self.highrise.chat(f"@{requester.username} الان دارم بررسی می‌کنم، صبر کن ⏳")
+            return
+
+        window_start = time.time()
+        self.report_monitoring_until = window_start + REPORT_WINDOW_SECONDS
+        await self.highrise.chat(
+            f"@{requester.username} چشم، {REPORT_WINDOW_SECONDS // 60} دقیقه چت رو زیرنظر می‌گیرم 👀"
+        )
+
+        await asyncio.sleep(REPORT_WINDOW_SECONDS)
+
+        window_messages = [
+            (ts, uid, uname, msg) for ts, uid, uname, msg in self.chat_log if ts >= window_start
+        ]
+        self.report_monitoring_until = None
+
+        if not window_messages:
+            return
+
+        conversation = "\n".join(f"{uname}: {msg}" for _, _, uname, msg in window_messages)
+        aggressors = await self.classify_report_window(conversation)
+        if not aggressors:
+            return
+
+        # آخرین username → user_id رو از همون پنجره‌ی زمانی پیدا کن
+        username_to_id = {}
+        for _, uid, uname, _ in window_messages:
+            username_to_id[uname.lower()] = uid
+
+        for name in aggressors:
+            uid = username_to_id.get(name.strip().lower())
+            if not uid:
+                continue
+            try:
+                await self.highrise.moderate_room(uid, "mute", MUTE_SECONDS)
+                hours = MUTE_SECONDS // 3600
+                for _, u_id2, uname2, _ in window_messages:
+                    if u_id2 == uid:
+                        target_user = User(id=uid, username=uname2)
+                        break
+                await self.go_greet_user(
+                    target_user, f"به‌خاطر دعوا/توهین توی چت، به مدت {hours} ساعت از صحبت‌کردن محدود شدی 🚫"
+                )
+            except Exception as e:
+                print(f"report-mode moderate_room error: {e}")
+
+    async def classify_report_window(self, conversation: str) -> list[str]:
+        """با یه فراخوانیِ AI، کل بازه رو یه‌جا تحلیل می‌کنه، نه پیام‌به‌پیام (صرفه‌جویی توکن)."""
         api_key = os.environ.get("AI_API_KEY", "").strip()
         if not api_key:
-            return False  # بدون AI، محافظه‌کارانه فرض می‌کنیم شوخیه
+            return []
 
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "یه پیام رو با زمینه‌ی گفتگوی قبلش می‌بینی. باید تشخیص بدی این پیام "
-                    "واقعاً توهین/دعوای جدیه، یا شوخیِ دوستانه بین رفقاست (که فحش‌های شوخی هم توش عادیه). "
-                    "فقط با یه کلمه جواب بده: SERIOUS یا JOKE. هیچ توضیح اضافه نده."
+                    "این یه بخشی از چتِ یه روم Highrise ـه. بررسی کن آیا یه دعوای واقعی و جدی "
+                    "(نه شوخی دوستانه) بین کاربرها اتفاق افتاده یا نه. "
+                    "اگه دعوای جدی بود، فقط یوزرنیم‌های کسایی که واقعاً توهین/دعوا کردن رو با کاما جدا کن. "
+                    "اگه دعوای جدی‌ای نبود، فقط بنویس: NONE. توضیح اضافه نده."
                 ),
             },
-            {
-                "role": "user",
-                "content": f"زمینه‌ی گفتگو:\n{context}\n\nپیام مورد بررسی: {text}",
-            },
+            {"role": "user", "content": conversation[-4000:]},
         ]
-        payload = {"model": self.ai_model, "messages": messages, "temperature": 0.0, "max_tokens": 5}
+        payload = {"model": self.ai_model, "messages": messages, "temperature": 0.0, "max_tokens": 60}
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        timeout = aiohttp.ClientTimeout(total=10)
+        timeout = aiohttp.ClientTimeout(total=20)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(self.ai_url, headers=headers, json=payload) as resp:
                     data = await resp.json(content_type=None)
-                    reply = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip().upper()
-                    return "SERIOUS" in reply
+                    reply = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    if not reply or reply.upper() == "NONE":
+                        return []
+                    return [name for name in reply.split(",") if name.strip()]
         except Exception as e:
-            print(f"Hostility classify error: {e}")
-            return False
-
-    async def handle_possible_hostility(self, user: User, text: str) -> None:
-        if not ROUGH_WORD_PATTERN.search(text):
-            return
-
-        context = await self.gather_nearby_context(user)
-        is_serious = await self.classify_hostility(text, context)
-        if not is_serious:
-            return  # شوخیه، بی‌خیال
-
-        now = time.time()
-        log = self.hostility_log[user.id]
-        log.append(now)
-        # فقط پیام‌های داخل بازه‌ی زمانی رو نگه دار
-        self.hostility_log[user.id] = [t for t in log if now - t <= HOSTILITY_WINDOW_SECONDS]
-
-        if len(self.hostility_log[user.id]) < HOSTILITY_THRESHOLD:
-            return
-
-        # سقف رد شد → میوت کن
-        self.hostility_log[user.id] = []
-        try:
-            await self.highrise.moderate_room(user.id, "mute", MUTE_SECONDS)
-        except Exception as e:
-            print(f"moderate_room error: {e}")
-            return
-
-        hours = MUTE_SECONDS // 3600
-        try:
-            await self.go_greet_user(
-                user, f"به‌خاطر توهین/دعوای مکرر، به مدت {hours} ساعت از صحبت‌کردن محدود شدی 🚫"
-            )
-        except Exception as e:
-            print(f"greet after mute error: {e}")
+            print(f"classify_report_window error: {e}")
+            return []
 
     # ---------- بیدار نگه‌داشتن Render (پلن رایگان) ----------
     async def _keepalive_loop(self) -> None:
@@ -589,8 +601,10 @@ class Bot(BaseBot):
             self.is_shutdown = True
             return
 
-        # --- تشخیص دعوای واقعی، روی همه‌ی پیام‌ها (نه فقط با !) ---
-        await self.handle_possible_hostility(user, text)
+        # --- #گزارش : چند دقیقه چت رو زیرنظر می‌گیره تا دعوای واقعی رو پیدا کنه ---
+        if text.strip() in {"#گزارش", "#report"}:
+            asyncio.create_task(self.start_report_monitoring(user))
+            return
 
         # اگه کاربر پابندِ منتظرِ پاسخِ «تنها» بود، یعنی جواب داد → دیگه بات نره سراغ یکی دیگه
         if self.pending_lonely_user_id == user.id:
