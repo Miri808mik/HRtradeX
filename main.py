@@ -137,6 +137,82 @@ class Bot(BaseBot):
         # مکالمه‌ی فعال با AI: (user_id, username, آخرین timestamp)
         self.current_ai_partner = None
 
+        # --- دنس لوپ ---
+        self._dance_task = None
+        self._dance_stop_event = None
+        self._dance_target_user_id = None
+        self._dance_emote_id = None
+        self.dance_repeat_delay = float(os.environ.get("DANCE_REPEAT_DELAY", "4.5"))
+
+
+    async def _stop_active_dance(self, announce: bool = False) -> bool:
+        """دنس فعلی را فوراً متوقف می‌کند."""
+        task = self._dance_task
+        if task is None:
+            if announce:
+                await self.highrise.chat("الان دنس فعالی ندارم.")
+            return False
+
+        stop_event = self._dance_stop_event
+        if stop_event is not None:
+            stop_event.set()
+
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"Dance task stop error: {e}")
+
+        self._dance_task = None
+        self._dance_stop_event = None
+        self._dance_target_user_id = None
+        self._dance_emote_id = None
+
+        if announce:
+            await self.highrise.chat("دنس متوقف شد ✅")
+        return True
+
+    async def _dance_loop(self, user_id: str, emote_id: str) -> None:
+        """یک دنس را تا وقتی stop داده نشده، پشت سر هم اجرا می‌کند."""
+        stop_event = self._dance_stop_event
+        if stop_event is None:
+            return
+
+        try:
+            while not stop_event.is_set():
+                await self.highrise.send_emote(emote_id, user_id)
+
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=self.dance_repeat_delay)
+                except asyncio.TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"Dance loop error: {e}")
+        finally:
+            if self._dance_task is asyncio.current_task():
+                self._dance_task = None
+                self._dance_stop_event = None
+                self._dance_target_user_id = None
+                self._dance_emote_id = None
+
+    async def _start_dance_loop(self, user: User, emote_id: str) -> None:
+        """دنس جدید را شروع می‌کند و اگر قبلی فعال باشد، آن را جایگزین می‌کند."""
+        await self._stop_active_dance(announce=False)
+
+        self._dance_stop_event = asyncio.Event()
+        self._dance_target_user_id = user.id
+        self._dance_emote_id = emote_id
+        self._dance_task = asyncio.create_task(self._dance_loop(user.id, emote_id))
+
+        await self.highrise.chat(
+            f"@{user.username} دنس لوپ شد 💃 (توقف: /stop)"
+        )
+
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot started")
         self.owner_id = session_metadata.room_info.owner_id
@@ -639,19 +715,16 @@ class Bot(BaseBot):
         if text.startswith("/"):
             payload = text[1:].strip()
             if payload.lower() in {"stop", "استوپ", "متوقف"}:
-                try:
-                    await self.highrise.send_emote("emote-hello", user.id)
-                    await self.highrise.chat(f"@{user.username} دنس متوقف شد ✅")
-                except Exception as e:
-                    print(f"Stop error: {e}")
+                await self._stop_active_dance(announce=True)
                 return
+
             emote_id = extract_emote_id(payload)
             if not emote_id:
                 await self.highrise.chat(f"@{user.username} فرمت دنس معتبر نیست.")
                 return
+
             try:
-                await self.highrise.send_emote(emote_id, user.id)
-                await self.highrise.chat(f"@{user.username} دنس شروع شد 💃 (توقف: /stop)")
+                await self._start_dance_loop(user, emote_id)
             except Exception as e:
                 print(f"Dance error: {e}")
                 await self.highrise.chat(f"@{user.username} این دنس اجرا نشد.")
@@ -695,7 +768,7 @@ class Bot(BaseBot):
         dance_id = find_dance_in_text(payload)
         if dance_id:
             try:
-                await self.highrise.send_emote(dance_id, user.id)
+                await self._start_dance_loop(user, dance_id)
                 await self.highrise.chat(f"@{user.username} " + random.choice(DANCE_REPLIES))
             except Exception as e:
                 print(f"Inline dance error: {e}")
