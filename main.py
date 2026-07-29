@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import random
 import threading
 import subprocess
@@ -80,6 +81,12 @@ DANCE_REPLIES = [
 EXTRA_OWNER_USERNAMES = {"syntaxerror.py"}
 DAILY_AI_LIMIT = 20
 
+# برای فهمیدن «کی نزدیک کیه»: شعاع (واحد مختصات Highrise) و بازه‌ی زمانی که پیام‌ها معتبرن
+# این عدد حدسیه، چون Highrise مقیاس دقیق فاصله رو مستند نکرده - نیاز به تست و تنظیم داره
+NEARBY_RADIUS = 5.0
+CONTEXT_WINDOW_SECONDS = 180  # ۳ دقیقه
+MAX_CONTEXT_MESSAGES = 15
+
 # آدرس عمومی سرویس روی Render، برای بیدار نگه‌داشتنش
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://hrtradex.onrender.com")
 
@@ -98,6 +105,10 @@ class Bot(BaseBot):
         self.movement_locked = False
         # کاربری که الان بات داره براش میره (برای جلوگیری از تداخل چند درخواست هم‌زمان)
         self.busy_with_username = None
+
+        # لاگ کل چت (حتی پیام‌های بدون !) برای فهمیدن زمینه‌ی گفتگو بعداً
+        # هر آیتم: (timestamp, user_id, username, text)
+        self.chat_log = deque(maxlen=300)
 
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot started")
@@ -193,7 +204,46 @@ class Bot(BaseBot):
         self.daily_usage[user_id] = (today, count + 1)
         return True
 
-    async def ask_gapgpt(self, user_id: str, username: str, text: str) -> str:
+    async def gather_nearby_context(self, requester: User) -> str:
+        """
+        پیام‌های اخیرِ افرادی که (بر اساس موقعیت فعلیشون) نزدیک درخواست‌دهنده هستن رو جمع می‌کنه.
+        این‌جوری گفتگوی «فوتبال» سمت چپ روم با گفتگوی «ماشین» سمت راست قاطی نمیشه.
+        """
+        result = await self.highrise.get_room_users()
+        if isinstance(result, Error):
+            return ""
+
+        positions = {}
+        for u, pos in result.content:
+            if isinstance(pos, Position):
+                positions[u.id] = pos
+
+        requester_pos = positions.get(requester.id)
+        if requester_pos is None:
+            return ""
+
+        # فاصله رو فقط روی صفحه‌ی زمین (x, z) حساب می‌کنیم، نه ارتفاع (y)
+        def distance(p):
+            return ((p.x - requester_pos.x) ** 2 + (p.z - requester_pos.z) ** 2) ** 0.5
+
+        nearby_user_ids = {
+            uid for uid, pos in positions.items() if distance(pos) <= NEARBY_RADIUS
+        }
+
+        now = time.time()
+        relevant = [
+            (ts, uname, msg)
+            for ts, uid, uname, msg in self.chat_log
+            if uid in nearby_user_ids and (now - ts) <= CONTEXT_WINDOW_SECONDS
+        ]
+        relevant = relevant[-MAX_CONTEXT_MESSAGES:]
+
+        if not relevant:
+            return ""
+
+        return "\n".join(f"{uname}: {msg}" for _, uname, msg in relevant)
+
+    async def ask_gapgpt(self, user_id: str, username: str, text: str, context: str = "") -> str:
         api_key = os.environ.get("AI_API_KEY", "").strip()
         if not api_key:
             return "AI_API_KEY تنظیم نشده."
@@ -210,6 +260,17 @@ class Bot(BaseBot):
         ]
         for item in self.histories[user_id]:
             messages.append(item)
+
+        if context:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "این‌ها پیام‌های اخیریه که افراد نزدیک همین کاربر توی چت گفتن "
+                    "(ممکنه خودِ کاربر هم توشون باشه). ازشون برای فهمیدن زمینه‌ی حرف کاربر استفاده کن، "
+                    "ولی توی جوابت مستقیم تکرارشون نکن:\n" + context
+                ),
+            })
+
         messages.append({"role": "user", "content": f"{username}: {text}"})
 
         payload = {
@@ -298,6 +359,9 @@ class Bot(BaseBot):
         text = message.strip()
         if not text:
             return
+
+        # همه‌ی پیام‌ها (حتی بدون !) رو ثبت می‌کنیم تا بعداً بشه زمینه‌ی گفتگو رو فهمید
+        self.chat_log.append((time.time(), user.id, user.username, text))
 
         # --- @بیا : فقط مالک ---
         if text in {"@بیا", "@come", "@بیا اینجا"}:
@@ -398,7 +462,9 @@ class Bot(BaseBot):
                 await self.highrise.chat(f"@{user.username} سهمیه‌ی امروزت ({DAILY_AI_LIMIT} پیام) تموم شده، فردا دوباره امتحان کن.")
                 return
 
-        reply = await self.ask_gapgpt(str(user.id), user.username, payload)
+        nearby_context = await self.gather_nearby_context(user)
+
+        reply = await self.ask_gapgpt(str(user.id), user.username, payload, context=nearby_context)
         await self.highrise.chat(reply)
 
 
