@@ -102,13 +102,17 @@ MAX_CONTEXT_MESSAGES = 15
 # آدرس عمومی سرویس روی Render، برای بیدار نگه‌داشتنش
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://hrtradex.onrender.com")
 
+# آدرس API حافظه‌ی بلندمدت (همون فایل‌های PHP روی هاست)
+DB_API_URL = os.environ.get("DB_API_URL", "").rstrip("/")
+DB_API_SECRET = os.environ.get("DB_API_SECRET", "")
+
 
 class Bot(BaseBot):
     def __init__(self):
         super().__init__()
         self.ai_url = "https://api.gapgpt.app/v1/chat/completions"
         self.ai_model = os.environ.get("AI_MODEL", "gpt-4.1")
-        self.histories = defaultdict(lambda: deque(maxlen=8))
+        self.histories = defaultdict(lambda: deque(maxlen=24))  # ۱۲ ردوبدل، یادش می‌مونه یه‌کم بیشتر
         self.owner_id = None
         self.own_user_id = None
         self.daily_usage = {}
@@ -136,82 +140,6 @@ class Bot(BaseBot):
 
         # مکالمه‌ی فعال با AI: (user_id, username, آخرین timestamp)
         self.current_ai_partner = None
-
-        # --- دنس لوپ ---
-        self._dance_task = None
-        self._dance_stop_event = None
-        self._dance_target_user_id = None
-        self._dance_emote_id = None
-        self.dance_repeat_delay = float(os.environ.get("DANCE_REPEAT_DELAY", "4.5"))
-
-
-    async def _stop_active_dance(self, announce: bool = False) -> bool:
-        """دنس فعلی را فوراً متوقف می‌کند."""
-        task = self._dance_task
-        if task is None:
-            if announce:
-                await self.highrise.chat("الان دنس فعالی ندارم.")
-            return False
-
-        stop_event = self._dance_stop_event
-        if stop_event is not None:
-            stop_event.set()
-
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                print(f"Dance task stop error: {e}")
-
-        self._dance_task = None
-        self._dance_stop_event = None
-        self._dance_target_user_id = None
-        self._dance_emote_id = None
-
-        if announce:
-            await self.highrise.chat("دنس متوقف شد ✅")
-        return True
-
-    async def _dance_loop(self, user_id: str, emote_id: str) -> None:
-        """یک دنس را تا وقتی stop داده نشده، پشت سر هم اجرا می‌کند."""
-        stop_event = self._dance_stop_event
-        if stop_event is None:
-            return
-
-        try:
-            while not stop_event.is_set():
-                await self.highrise.send_emote(emote_id, user_id)
-
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=self.dance_repeat_delay)
-                except asyncio.TimeoutError:
-                    continue
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            print(f"Dance loop error: {e}")
-        finally:
-            if self._dance_task is asyncio.current_task():
-                self._dance_task = None
-                self._dance_stop_event = None
-                self._dance_target_user_id = None
-                self._dance_emote_id = None
-
-    async def _start_dance_loop(self, user: User, emote_id: str) -> None:
-        """دنس جدید را شروع می‌کند و اگر قبلی فعال باشد، آن را جایگزین می‌کند."""
-        await self._stop_active_dance(announce=False)
-
-        self._dance_stop_event = asyncio.Event()
-        self._dance_target_user_id = user.id
-        self._dance_emote_id = emote_id
-        self._dance_task = asyncio.create_task(self._dance_loop(user.id, emote_id))
-
-        await self.highrise.chat(
-            f"@{user.username} دنس لوپ شد 💃 (توقف: /stop)"
-        )
 
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         print("Bot started")
@@ -383,6 +311,13 @@ class Bot(BaseBot):
             # فاصله‌ی تصادفی بین ۶ تا ۱۲ دقیقه، تا همیشه یه عدد ثابت نباشه
             wait_seconds = random.randint(6 * 60, 12 * 60)
             await asyncio.sleep(wait_seconds)
+
+            if self.is_shutdown:
+                # وقتی @خاموش گفته شده، دیگه پینگ نمی‌فرستیم تا Render خودش بعد از
+                # حدود ۱۵ دقیقه بی‌کاری، سرویس رو واقعاً بخوابونه
+                print("Keepalive skipped (bot is shut down)")
+                continue
+
             try:
                 timeout = aiohttp.ClientTimeout(total=15)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -494,6 +429,35 @@ class Bot(BaseBot):
 
         return "\n".join(f"{uname}: {msg}" for _, uname, msg in relevant)
 
+    # ---------- حافظه‌ی بلندمدت (از طریق API روی هاست) ----------
+    async def get_long_term_memory(self, user_id: str) -> str | None:
+        if not DB_API_URL:
+            return None
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                params = {"user_id": user_id, "secret": DB_API_SECRET}
+                async with session.get(f"{DB_API_URL}/get_memory.php", params=params) as resp:
+                    data = await resp.json(content_type=None)
+                    return data.get("note")
+        except Exception as e:
+            print(f"get_long_term_memory error: {e}")
+            return None
+
+    async def save_long_term_memory(self, user_id: str, note: str) -> bool:
+        if not DB_API_URL:
+            return False
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                payload = {"user_id": user_id, "note": note, "secret": DB_API_SECRET}
+                async with session.post(f"{DB_API_URL}/save_memory.php", data=payload) as resp:
+                    data = await resp.json(content_type=None)
+                    return bool(data.get("ok"))
+        except Exception as e:
+            print(f"save_long_term_memory error: {e}")
+            return False
+
     async def ask_gapgpt(self, user_id: str, username: str, text: str, context: str = "") -> str:
         api_key = os.environ.get("AI_API_KEY", "").strip()
         if not api_key:
@@ -513,6 +477,14 @@ class Bot(BaseBot):
                 ),
             }
         ]
+
+        long_term_note = await self.get_long_term_memory(user_id)
+        if long_term_note:
+            messages.append({
+                "role": "system",
+                "content": f"چیزهایی که قبلاً درباره‌ی این کاربر یاد گرفتی: {long_term_note}",
+            })
+
         for item in self.histories[user_id]:
             messages.append(item)
 
@@ -715,16 +687,19 @@ class Bot(BaseBot):
         if text.startswith("/"):
             payload = text[1:].strip()
             if payload.lower() in {"stop", "استوپ", "متوقف"}:
-                await self._stop_active_dance(announce=True)
+                try:
+                    await self.highrise.send_emote("emote-hello", user.id)
+                    await self.highrise.chat(f"@{user.username} دنس متوقف شد ✅")
+                except Exception as e:
+                    print(f"Stop error: {e}")
                 return
-
             emote_id = extract_emote_id(payload)
             if not emote_id:
                 await self.highrise.chat(f"@{user.username} فرمت دنس معتبر نیست.")
                 return
-
             try:
-                await self._start_dance_loop(user, emote_id)
+                await self.highrise.send_emote(emote_id, user.id)
+                await self.highrise.chat(f"@{user.username} دنس شروع شد 💃 (توقف: /stop)")
             except Exception as e:
                 print(f"Dance error: {e}")
                 await self.highrise.chat(f"@{user.username} این دنس اجرا نشد.")
@@ -744,6 +719,20 @@ class Bot(BaseBot):
         if lower == "clear":
             self.histories.pop(str(user.id), None)
             await self.highrise.chat(f"@{user.username} حافظه پاک شد ✅")
+            return
+
+        # --- !یادت بمونه <متن> : ذخیره‌ی یه نکته توی حافظه‌ی بلندمدت کاربر ---
+        if lower.startswith("یادت بمونه") or lower.startswith("یادت باشه"):
+            note = payload.split(" ", 2)
+            note_text = note[2] if len(note) > 2 else ""
+            if not note_text.strip():
+                await self.highrise.chat(f"@{user.username} بعد از 'یادت بمونه' باید یه متن بنویسی")
+                return
+            saved = await self.save_long_term_memory(str(user.id), note_text.strip())
+            if saved:
+                await self.highrise.chat(f"@{user.username} باشه، یادم موند 🧠")
+            else:
+                await self.highrise.chat(f"@{user.username} نتونستم ذخیره کنم، بعداً امتحان کن")
             return
 
         # --- تشخیص نیت «بیا اینجا/کنارم/پیشم» : بات میره کنار هر کسی که این‌رو بگه ---
@@ -768,7 +757,7 @@ class Bot(BaseBot):
         dance_id = find_dance_in_text(payload)
         if dance_id:
             try:
-                await self._start_dance_loop(user, dance_id)
+                await self.highrise.send_emote(dance_id, user.id)
                 await self.highrise.chat(f"@{user.username} " + random.choice(DANCE_REPLIES))
             except Exception as e:
                 print(f"Inline dance error: {e}")
