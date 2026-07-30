@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import random
 import threading
@@ -105,6 +106,7 @@ PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://hrtradex.onrender.com")
 # آدرس API حافظه‌ی بلندمدت (همون فایل‌های PHP روی هاست)
 DB_API_URL = os.environ.get("DB_API_URL", "").rstrip("/")
 DB_API_SECRET = os.environ.get("DB_API_SECRET", "")
+DATASET_BATCH_SIZE = 100
 
 
 class Bot(BaseBot):
@@ -126,6 +128,9 @@ class Bot(BaseBot):
         # لاگ کل چت (حتی پیام‌های بدون !) برای فهمیدن زمینه‌ی گفتگو بعداً
         # هر آیتم: (timestamp, user_id, username, text)
         self.chat_log = deque(maxlen=300)
+
+        # بافر پیام‌ها برای ساخت دیتاست؛ هر ۱۰۰ تا که جمع شد، یه‌جا پردازش و ذخیره میشن
+        self.dataset_buffer = []
 
         # @خاموش / @روشن
         self.is_shutdown = False
@@ -458,6 +463,63 @@ class Bot(BaseBot):
             print(f"save_long_term_memory error: {e}")
             return False
 
+    # ---------- ساخت دیتاست: هر ۱۰۰ پیام یه‌جا پاک‌سازی و ذخیره میشن ----------
+    async def process_dataset_batch(self) -> None:
+        batch = self.dataset_buffer[:DATASET_BATCH_SIZE]
+        self.dataset_buffer = self.dataset_buffer[DATASET_BATCH_SIZE:]
+
+        numbered = "\n".join(f"{i+1}: {msg}" for i, msg in enumerate(batch))
+
+        api_key = os.environ.get("AI_API_KEY", "").strip()
+        bad_numbers = set()
+        if api_key:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "این‌ها پیام‌های چت یه روم Highrise هستن، شماره‌گذاری شده. "
+                        "بگو کدوم شماره‌ها باید حذف بشن چون فحش/توهین/اسپم/بی‌معنی هستن. "
+                        "فقط شماره‌ها رو با کاما جدا کن (مثلاً: 3,17,42). اگه هیچی نبود بنویس NONE."
+                    ),
+                },
+                {"role": "user", "content": numbered[-6000:]},
+            ]
+            payload = {"model": self.ai_model, "messages": messages, "temperature": 0.0, "max_tokens": 200}
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            timeout = aiohttp.ClientTimeout(total=25)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(self.ai_url, headers=headers, json=payload) as resp:
+                        data = await resp.json(content_type=None)
+                        reply = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                        if reply and reply.upper() != "NONE":
+                            for part in reply.split(","):
+                                part = part.strip()
+                                if part.isdigit():
+                                    bad_numbers.add(int(part))
+            except Exception as e:
+                print(f"process_dataset_batch classify error: {e}")
+
+        clean_messages = [msg for i, msg in enumerate(batch) if (i + 1) not in bad_numbers]
+        # حذف تکراری‌های داخل همین دسته (دیتابیس هم خودش تکراری‌های قدیمی‌تر رو با UNIQUE KEY رد می‌کنه)
+        clean_messages = list(dict.fromkeys(clean_messages))
+
+        if not clean_messages or not DB_API_URL:
+            return
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                payload = {
+                    "messages": json.dumps(clean_messages, ensure_ascii=False),
+                    "secret": DB_API_SECRET,
+                }
+                async with session.post(f"{DB_API_URL}/save_dataset.php", data=payload) as resp:
+                    result = await resp.json(content_type=None)
+                    print(f"Dataset batch saved: {result}")
+        except Exception as e:
+            print(f"save_dataset batch error: {e}")
+
     async def ask_gapgpt(self, user_id: str, username: str, text: str, context: str = "") -> str:
         api_key = os.environ.get("AI_API_KEY", "").strip()
         if not api_key:
@@ -512,27 +574,34 @@ class Bot(BaseBot):
         }
         timeout = aiohttp.ClientTimeout(total=25)
 
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(self.ai_url, headers=headers, json=payload) as resp:
-                    data = await resp.json(content_type=None)
-                    if resp.status != 200:
-                        print("GapGPT error:", resp.status, data)
-                        return "فعلاً نتونستم جواب بدم."
-                    reply = (
-                        data.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content", "")
-                        .strip()
-                    )
-                    if not reply:
-                        return "جوابی نگرفتم."
-                    self.histories[user_id].append({"role": "user", "content": f"{username}: {text}"})
-                    self.histories[user_id].append({"role": "assistant", "content": reply})
-                    return reply[:250]
-        except Exception as e:
-            print("AI request error:", e)
-            return "مشکل در ارتباط با هوش مصنوعی."
+        for attempt in range(2):  # یه‌بار تلاش دوباره، چون GapGPT گاهی ناپایداره
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(self.ai_url, headers=headers, json=payload) as resp:
+                        data = await resp.json(content_type=None)
+                        if resp.status != 200:
+                            print("GapGPT error:", resp.status, data)
+                            if attempt == 0:
+                                continue
+                            return "فعلاً نتونستم جواب بدم."
+                        reply = (
+                            data.get("choices", [{}])[0]
+                            .get("message", {})
+                            .get("content", "")
+                            .strip()
+                        )
+                        if not reply:
+                            if attempt == 0:
+                                continue
+                            return "جوابی نگرفتم."
+                        self.histories[user_id].append({"role": "user", "content": f"{username}: {text}"})
+                        self.histories[user_id].append({"role": "assistant", "content": reply})
+                        return reply[:250]
+            except Exception as e:
+                print("AI request error:", e)
+                if attempt == 0:
+                    continue
+                return "مشکل در ارتباط با هوش مصنوعی."
 
     async def handle_come_here_with_priority(self, requester: User, payload: str) -> None:
         partner = self.current_ai_partner
@@ -627,6 +696,11 @@ class Bot(BaseBot):
 
         # همه‌ی پیام‌ها (حتی بدون !) رو ثبت می‌کنیم تا بعداً بشه زمینه‌ی گفتگو رو فهمید
         self.chat_log.append((time.time(), user.id, user.username, text))
+
+        # برای دیتاست: هر ۱۰۰ پیام که جمع شد، یه‌جا پردازش و ذخیره میشه
+        self.dataset_buffer.append(text)
+        if len(self.dataset_buffer) >= DATASET_BATCH_SIZE:
+            asyncio.create_task(self.process_dataset_batch())
 
         # --- @روشن : همیشه کار می‌کنه، حتی وقتی خاموشیم ---
         if text in {"@روشن", "@on"}:
