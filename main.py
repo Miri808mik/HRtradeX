@@ -13,7 +13,7 @@ from collections import defaultdict, deque
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
-from highrise import BaseBot, SessionMetadata, User, Position, AnchorPosition, Error
+from highrise import BaseBot, SessionMetadata, User, Position, AnchorPosition, Error, Item
 
 
 class SimpleHandler(BaseHTTPRequestHandler):
@@ -332,6 +332,97 @@ class Bot(BaseBot):
                 print(f"Keepalive ping failed: {e}")
 
     # ---------- اومدن کنار یه کاربر (برای @بیا و !سلام هر دو) ----------
+    # ---------- مدیریت آیتم/آواتار بات ----------
+    async def cmd_buy_item(self, requester: User, item_id: str) -> None:
+        try:
+            result = await self.highrise.buy_item(item_id)
+        except Exception as e:
+            print(f"buy_item error: {e}")
+            await self.highrise.chat(f"@{requester.username} خرید انجام نشد (خطای غیرمنتظره).")
+            return
+
+        if isinstance(result, Error):
+            await self.highrise.chat(f"@{requester.username} خرید ناموفق: {result.message}")
+            return
+        if result == "insufficient_funds":
+            await self.highrise.chat(f"@{requester.username} گلد بات کافی نیست 💸")
+            return
+        await self.highrise.chat(f"@{requester.username} خریداری شد ✅ حالا با !بپوش {item_id} می‌تونی بپوشونیش")
+
+    async def cmd_wear_item(self, requester: User, item_id: str) -> None:
+        outfit_result = await self.highrise.get_my_outfit()
+        if isinstance(outfit_result, Error):
+            await self.highrise.chat(f"@{requester.username} نتونستم لباس فعلی رو بخونم.")
+            return
+
+        current_items = list(outfit_result.outfit)
+        # اگه از قبل پوشیده، دوباره اضافه نکن
+        if any(it.id == item_id for it in current_items):
+            await self.highrise.chat(f"@{requester.username} این آیتم از قبل پوشیدمش.")
+            return
+
+        new_item = Item(type="clothing", amount=1, id=item_id)
+        new_outfit = current_items + [new_item]
+
+        try:
+            result = await self.highrise.set_outfit(new_outfit)
+        except Exception as e:
+            print(f"set_outfit error: {e}")
+            await self.highrise.chat(f"@{requester.username} پوشیدن انجام نشد (خطای غیرمنتظره).")
+            return
+
+        if isinstance(result, Error):
+            await self.highrise.chat(
+                f"@{requester.username} پوشیدن ناموفق: {result.message} "
+                f"(احتمالاً این آیتم رو نداری، اول با !بخر {item_id} بخرش)"
+            )
+            return
+        await self.highrise.chat(f"@{requester.username} پوشیدم ✅")
+
+    async def cmd_unwear_item(self, requester: User, item_id: str) -> None:
+        outfit_result = await self.highrise.get_my_outfit()
+        if isinstance(outfit_result, Error):
+            await self.highrise.chat(f"@{requester.username} نتونستم لباس فعلی رو بخونم.")
+            return
+
+        current_items = list(outfit_result.outfit)
+        new_outfit = [it for it in current_items if it.id != item_id]
+
+        if len(new_outfit) == len(current_items):
+            await self.highrise.chat(f"@{requester.username} این آیتم رو اصلاً پوشیده نبودم.")
+            return
+
+        try:
+            result = await self.highrise.set_outfit(new_outfit)
+        except Exception as e:
+            print(f"set_outfit error: {e}")
+            await self.highrise.chat(f"@{requester.username} درآوردن انجام نشد.")
+            return
+
+        if isinstance(result, Error):
+            await self.highrise.chat(f"@{requester.username} درآوردن ناموفق: {result.message}")
+            return
+        await self.highrise.chat(f"@{requester.username} درش آوردم ✅")
+
+    async def cmd_show_outfit(self, requester: User) -> None:
+        outfit_result = await self.highrise.get_my_outfit()
+        if isinstance(outfit_result, Error):
+            await self.highrise.chat(f"@{requester.username} نتونستم لباس فعلی رو بخونم.")
+            return
+        ids = [it.id for it in outfit_result.outfit]
+        await self.highrise.chat(f"@{requester.username} الان پوشیدم: " + ", ".join(ids[:10]))
+
+    async def cmd_show_inventory(self, requester: User) -> None:
+        inv_result = await self.highrise.get_inventory()
+        if isinstance(inv_result, Error):
+            await self.highrise.chat(f"@{requester.username} نتونستم کمد رو بخونم.")
+            return
+        ids = [it.id for it in inv_result.items]
+        if not ids:
+            await self.highrise.chat(f"@{requester.username} کمدم خالیه.")
+            return
+        await self.highrise.chat(f"@{requester.username} توی کمدم: " + ", ".join(ids[:15]))
+
     async def go_greet_user(self, requester: User, say_after: str) -> None:
         # شرط ۱: اگه بات قفله، اصلاً حرکت نکن
         if self.movement_locked:
@@ -812,6 +903,45 @@ class Bot(BaseBot):
         # --- تشخیص نیت «بیا اینجا/کنارم/پیشم» : بات میره کنار هر کسی که این‌رو بگه ---
         if is_come_here_request(payload):
             await self.handle_come_here_with_priority(user, payload)
+            return
+
+        # --- مدیریت آیتم/آواتار بات: فقط مالک ---
+        if lower.startswith("بخر "):
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            item_id = payload.split(" ", 1)[1].strip()
+            await self.cmd_buy_item(user, item_id)
+            return
+
+        if lower.startswith("بپوش "):
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            item_id = payload.split(" ", 1)[1].strip()
+            await self.cmd_wear_item(user, item_id)
+            return
+
+        if lower.startswith("دربیار "):
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            item_id = payload.split(" ", 1)[1].strip()
+            await self.cmd_unwear_item(user, item_id)
+            return
+
+        if lower in {"لباسام", "outfit"}:
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            await self.cmd_show_outfit(user)
+            return
+
+        if lower in {"کمدم", "inventory"}:
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            await self.cmd_show_inventory(user)
             return
 
         if lower == "quota":
