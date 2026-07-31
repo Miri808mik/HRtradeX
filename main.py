@@ -423,6 +423,17 @@ class Bot(BaseBot):
             return
         await self.highrise.chat(f"@{requester.username} توی کمدم: " + ", ".join(ids[:15]))
 
+    async def cmd_show_wallet(self, requester: User) -> None:
+        wallet_result = await self.highrise.get_wallet()
+        if isinstance(wallet_result, Error):
+            await self.highrise.chat(f"@{requester.username} نتونستم کیف‌پول رو بخونم.")
+            return
+        parts = [f"{c.type}: {c.amount}" for c in wallet_result.content]
+        if not parts:
+            await self.highrise.chat(f"@{requester.username} کیف‌پولم خالیه.")
+            return
+        await self.highrise.chat(f"@{requester.username} کیف‌پولم: " + " | ".join(parts))
+
     async def go_greet_user(self, requester: User, say_after: str) -> None:
         # شرط ۱: اگه بات قفله، اصلاً حرکت نکن
         if self.movement_locked:
@@ -942,6 +953,13 @@ class Bot(BaseBot):
                 await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
                 return
             await self.cmd_show_inventory(user)
+            return
+
+        if lower in {"کیف‌پولم", "کیف پولم", "wallet"}:
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            await self.cmd_show_wallet(user)
             return
 
         if lower == "quota":
