@@ -53,6 +53,28 @@ def extract_emote_id(raw_value: str):
     return value
 
 
+def extract_item_id(raw_value: str):
+    """
+    آیدی آیتم رو از یه لینک high.rs/item?id=... استخراج می‌کنه، یا اگه خودِ آیدی خام بود همونو برمی‌گردونه.
+    مثال لینک: https://high.rs/item?id=sock-n_starteritems2020whitekneelength&type=clothing
+    """
+    value = raw_value.strip()
+    if not value:
+        return None
+    if value.startswith(("http://", "https://")):
+        parsed = urlparse(value)
+        if "high.rs" not in parsed.netloc:
+            return None
+        query = parse_qs(parsed.query)
+        item_id = query.get("id", [None])[0]
+        return item_id.strip() if item_id else None
+    if value.startswith(("high.rs/", "www.high.rs/")):
+        return extract_item_id("https://" + value)
+    if " " in value:
+        return None
+    return value
+
+
 def find_dance_in_text(text: str):
     """دنبال لینک high.rs یا آیدی خام (مثل dance-xxx) هر جای متن می‌گرده، حتی وسط یه جمله."""
     match = HIGHRS_LINK_RE.search(text)
@@ -953,7 +975,11 @@ class Bot(BaseBot):
             if not self.is_owner(user):
                 await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
                 return
-            item_id = payload.split(" ", 1)[1].strip()
+            raw = payload.split(" ", 1)[1].strip()
+            item_id = extract_item_id(raw)
+            if item_id is None:
+                await self.highrise.chat(f"@{user.username} آیدی آیتم معتبر نیست.")
+                return
             await self.cmd_buy_item(user, item_id)
             return
 
@@ -961,7 +987,11 @@ class Bot(BaseBot):
             if not self.is_owner(user):
                 await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
                 return
-            item_id = payload.split(" ", 1)[1].strip()
+            raw = payload.split(" ", 1)[1].strip()
+            item_id = extract_item_id(raw)
+            if item_id is None:
+                await self.highrise.chat(f"@{user.username} آیدی آیتم معتبر نیست.")
+                return
             await self.cmd_wear_item(user, item_id)
             return
 
@@ -969,7 +999,11 @@ class Bot(BaseBot):
             if not self.is_owner(user):
                 await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
                 return
-            item_id = payload.split(" ", 1)[1].strip()
+            raw = payload.split(" ", 1)[1].strip()
+            item_id = extract_item_id(raw)
+            if item_id is None:
+                await self.highrise.chat(f"@{user.username} آیدی آیتم معتبر نیست.")
+                return
             await self.cmd_unwear_item(user, item_id)
             return
 
