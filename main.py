@@ -349,6 +349,26 @@ class Bot(BaseBot):
             return
         await self.highrise.chat(f"@{requester.username} خریداری شد ✅ حالا با !بپوش {item_id} می‌تونی بپوشونیش")
 
+    # دسته‌هایی که پیشوندشون دو تیکه‌ای‌ه (با یه خط‌تیره وسطشون)، نه یه تیکه
+    KNOWN_TWO_PART_CATEGORIES = {
+        "hair-front", "hair-back", "hair_front", "hair_back",
+        "eye-color", "eye_color",
+    }
+
+    def _get_item_category(self, item_id: str) -> str:
+        """
+        پیشوند دسته‌ی آیتم رو از روی آیدیش تشخیص میده (مثلاً 'shirt' از 'shirt-abc123').
+        برای دسته‌های دو‌تیکه‌ای شناخته‌شده (مثل hair-front) دو تیکه‌ی اول رو نگه می‌داره.
+        این یه تشخیصِ حدسیه بر اساس الگوهای رایج؛ اگه یه دسته‌ی جدید و ناشناخته دیدی که
+        درست تشخیص داده نشد، به KNOWN_TWO_PART_CATEGORIES اضافه‌ش کن.
+        """
+        parts = item_id.split("-")
+        if len(parts) >= 2:
+            two_part = f"{parts[0]}-{parts[1]}".lower()
+            if two_part in self.KNOWN_TWO_PART_CATEGORIES:
+                return two_part
+        return parts[0]
+
     async def cmd_wear_item(self, requester: User, item_id: str) -> None:
         outfit_result = await self.highrise.get_my_outfit()
         if isinstance(outfit_result, Error):
@@ -356,13 +376,23 @@ class Bot(BaseBot):
             return
 
         current_items = list(outfit_result.outfit)
-        # اگه از قبل پوشیده، دوباره اضافه نکن
+
+        # اگه از قبل دقیقاً همین آیتم پوشیده، دوباره اضافه نکن
         if any(it.id == item_id for it in current_items):
             await self.highrise.chat(f"@{requester.username} این آیتم از قبل پوشیدمش.")
             return
 
-        new_item = Item(type="clothing", amount=1, id=item_id)
-        new_outfit = current_items + [new_item]
+        category = self._get_item_category(item_id)
+
+        # هر آیتم دیگه‌ای که توی همین دسته‌ست رو از لباس فعلی حذف کن
+        # (چون هر دسته - مثل shirt، pants، eye - فقط یه آیتم هم‌زمان مجازه)
+        new_outfit = [
+            it for it in current_items
+            if self._get_item_category(it.id) != category
+        ]
+
+        new_item = Item(type="clothing", amount=1, id=item_id, active_palette=0)
+        new_outfit.append(new_item)
 
         try:
             result = await self.highrise.set_outfit(new_outfit)
@@ -374,7 +404,9 @@ class Bot(BaseBot):
         if isinstance(result, Error):
             await self.highrise.chat(
                 f"@{requester.username} پوشیدن ناموفق: {result.message} "
-                f"(احتمالاً این آیتم رو نداری، اول با !بخر {item_id} بخرش)"
+                f"(ممکنه آیدی آیتم اشتباه باشه، یا نیاز به خرید داشته باشه - "
+                f"آیتم‌های رایگان با rarity=none نیازی به خرید ندارن، پس اگه پیام هنوز میاد "
+                f"با !بخر {item_id} امتحان کن)"
             )
             return
         await self.highrise.chat(f"@{requester.username} پوشیدم ✅")
