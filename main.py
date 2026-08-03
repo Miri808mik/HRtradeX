@@ -76,6 +76,13 @@ def extract_item_id(raw_value: str):
     return value
 
 
+def _is_positive_float(value: str) -> bool:
+    try:
+        return float(value) > 0
+    except ValueError:
+        return False
+
+
 def find_dance_in_text(text: str):
     """دنبال لینک high.rs یا آیدی خام (مثل dance-xxx) هر جای متن می‌گرده، حتی وسط یه جمله."""
     match = HIGHRS_LINK_RE.search(text)
@@ -429,7 +436,7 @@ class Bot(BaseBot):
     COLOR_CATEGORY_ALIASES = {
         "چشم": "eye",
         "مو": "hair",
-        "پوست": "skin",
+        "پوست": "body",  # آیدی واقعیش چیزی مثل body-flesh هست، نه skin
         "ابرو": "eyebrow",
     }
 
@@ -1186,12 +1193,18 @@ class Bot(BaseBot):
                 await self.cmd_remove_all(user)
                 return
             category = self.CATEGORY_ALIASES.get(word)
-            if not category:
-                await self.highrise.chat(
-                    f"@{user.username} این دسته رو نمی‌شناسم. الان فقط: کلاه، عینک، کفش، همه"
-                )
+            if category:
+                await self.cmd_remove_category(user, category)
                 return
-            await self.cmd_remove_category(user, category)
+            # دسته‌ی شناخته‌شده نبود؛ شاید خودِ لینک/آیدی یه آیتم خاص باشه
+            item_id = extract_item_id(word)
+            if item_id:
+                await self.cmd_unwear_item(user, item_id)
+                return
+            await self.highrise.chat(
+                f"@{user.username} این‌رو نشناختم — یا اسم دسته (کلاه/عینک/کفش/همه) بده، "
+                f"یا لینک/آیدی خودِ آیتم رو بفرست."
+            )
             return
 
         # --- !رنگ <چشم/مو/پوست/ابرو> <شماره> ---
@@ -1233,30 +1246,27 @@ class Bot(BaseBot):
             return
 
         # --- !دنس <emote_id> <ثانیه> : اضافه/آپدیت‌کردن duration توی جدول ---
+        # --- !دنس <emote_id> <ثانیه> : فقط وقتی دقیقاً همین فرمت باشه ذخیره می‌کنیم
+        # وگرنه (مثل "!دنس اجرا کن برام <لینک>") میره پایین‌تر برای تشخیص خودکار دنس ---
         if lower.startswith("دنس "):
-            if not self.is_owner(user):
-                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
-                return
             parts = payload.split()
-            if len(parts) != 3:
-                await self.highrise.chat(f"@{user.username} فرمت درست: !دنس dance-floss 7.8")
-                return
-            raw_id, seconds_str = parts[1], parts[2]
-            emote_id = extract_emote_id(raw_id)
-            if not emote_id:
-                await self.highrise.chat(f"@{user.username} آیدی دنس معتبر نیست.")
-                return
-            try:
+            looks_like_save_format = len(parts) == 3 and _is_positive_float(parts[2])
+
+            if looks_like_save_format:
+                if not self.is_owner(user):
+                    await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                    return
+                raw_id, seconds_str = parts[1], parts[2]
+                emote_id = extract_emote_id(raw_id)
+                if not emote_id:
+                    await self.highrise.chat(f"@{user.username} آیدی دنس معتبر نیست.")
+                    return
                 seconds = float(seconds_str)
-                if seconds <= 0:
-                    raise ValueError
-            except ValueError:
-                await self.highrise.chat(f"@{user.username} عدد ثانیه معتبر نیست.")
+                self.dances[emote_id] = seconds
+                save_dances(self.dances)
+                await self.highrise.chat(f"@{user.username} ذخیره شد ✅ {emote_id} → {seconds} ثانیه")
                 return
-            self.dances[emote_id] = seconds
-            save_dances(self.dances)
-            await self.highrise.chat(f"@{user.username} ذخیره شد ✅ {emote_id} → {seconds} ثانیه")
-            return
+            # فرمت مدیریتی نبود → فال‌ترو به تشخیص خودکار دنس پایین‌تر (find_dance_in_text)
 
         if lower in {"کیف‌پولم", "کیف پولم", "wallet"}:
             if not self.is_owner(user):
@@ -1282,7 +1292,7 @@ class Bot(BaseBot):
         dance_id = find_dance_in_text(payload)
         if dance_id:
             try:
-                await self.highrise.send_emote(dance_id, user.id)
+                self._start_user_dance(user.id, dance_id)
                 await self.highrise.chat(f"@{user.username} " + random.choice(DANCE_REPLIES))
             except Exception as e:
                 print(f"Inline dance error: {e}")
