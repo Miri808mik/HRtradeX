@@ -83,6 +83,25 @@ def _is_positive_float(value: str) -> bool:
         return False
 
 
+def extract_username_from_link(raw_value: str):
+    """از لینکی مثل high.rs/user?name=SyntaxError.py یوزرنیم رو درمیاره، یا اگه خام بود همونو برمی‌گردونه."""
+    value = raw_value.strip().lstrip("@")
+    if not value:
+        return None
+    if value.startswith(("http://", "https://")):
+        parsed = urlparse(value)
+        if "high.rs" not in parsed.netloc:
+            return None
+        query = parse_qs(parsed.query)
+        name = query.get("name", [None])[0]
+        return name.strip() if name else None
+    if value.startswith(("high.rs/", "www.high.rs/")):
+        return extract_username_from_link("https://" + value)
+    if " " in value:
+        return None
+    return value
+
+
 def find_dance_in_text(text: str):
     """دنبال لینک high.rs یا آیدی خام (مثل dance-xxx) هر جای متن می‌گرده، حتی وسط یه جمله."""
     match = HIGHRS_LINK_RE.search(text)
@@ -202,6 +221,9 @@ class Bot(BaseBot):
         # حالت گزارش: وقتی #گزارش گفته میشه، تا این timestamp چت رو زیر نظر می‌گیره
         self.report_monitoring_until = None
 
+        # ادمین‌هایی که با !ادمین اضافه شدن (فقط RAM، با ری‌استارت پاک میشه)
+        self.admin_ids = set()
+
         # جدول دنس‌ها (emote_id -> duration) + وضعیت لوپِ هر کاربر
         self.dances = load_dances()
         self.user_dance_states = {}  # user_id -> (stop_event, task)
@@ -292,10 +314,56 @@ class Bot(BaseBot):
     async def on_user_leave(self, user: User) -> None:
         await self._stop_user_dance(user.id)
 
-    def is_owner(self, user: User) -> bool:
+    async def on_whisper(self, user: User, message: str) -> None:
+        if self.is_owner(user):
+            # مالک/ادمین: دقیقاً مثل چت عمومی پردازش میشه (دستورها اجرا میشن)
+            # نکته: جواب‌ها همچنان توی خودِ روم (چت عمومی) نمایش داده میشن،
+            # چون همه‌ی دستورها از self.highrise.chat استفاده می‌کنن، نه whisper.
+            await self.on_chat(user, message)
+            return
+
+        # کاربر عادی: فقط راهنما، بدون اجرای هیچ دستوری
+        try:
+            await self.highrise.send_whisper(
+                user.id,
+                "سلام! من فقط یه بات معمولیم 🙂 برای صحبت باهام توی خودِ روم بنویس، "
+                "مثلاً: !سلام یا هر سوالی با ! جلوش.",
+            )
+        except Exception as e:
+            print(f"on_whisper reply error: {e}")
+
+    def is_true_owner(self, user: User) -> bool:
+        """فقط مالک واقعی، نه ادمین‌ها - برای دستوراتی مثل !ادمین که نباید دست ادمین‌ها باشه."""
         if self.owner_id and user.id == self.owner_id:
             return True
         return user.username.lower() in EXTRA_OWNER_USERNAMES
+
+    def is_owner(self, user: User) -> bool:
+        """مالک واقعی + ادمین‌هایی که با !ادمین اضافه شدن، هر دو دسترسی یکسان دارن."""
+        if self.is_true_owner(user):
+            return True
+        return user.id in self.admin_ids
+
+    async def add_admin_by_link(self, requester: User, link_or_username: str) -> None:
+        username = extract_username_from_link(link_or_username)
+        if not username:
+            await self.highrise.chat(f"@{requester.username} لینک/یوزرنیم معتبر نیست.")
+            return
+        try:
+            result = await self.webapi.get_users(username=username)
+        except Exception as e:
+            print(f"get_users error: {e}")
+            await self.highrise.chat(f"@{requester.username} خطا توی پیدا کردن کاربر.")
+            return
+
+        users = result.users
+        if not users:
+            await self.highrise.chat(f"@{requester.username} همچین کاربری پیدا نشد.")
+            return
+
+        target_id = users[0].user_id
+        self.admin_ids.add(target_id)
+        await self.highrise.chat(f"@{requester.username} {username} ادمین شد ✅")
 
     # ---------- حالت گزارش: با #گزارش فعال میشه، چند دقیقه چت رو زیرنظر می‌گیره ----------
     async def start_report_monitoring(self, requester: User) -> None:
@@ -1144,6 +1212,15 @@ class Bot(BaseBot):
         # --- تشخیص نیت «بیا اینجا/کنارم/پیشم» : بات میره کنار هر کسی که این‌رو بگه ---
         if is_come_here_request(payload):
             await self.handle_come_here_with_priority(user, payload)
+            return
+
+        # --- !ادمین <لینک/یوزرنیم> : فقط مالک واقعی می‌تونه ادمین اضافه کنه ---
+        if lower.startswith("ادمین "):
+            if not self.is_true_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک اصلی بات فعاله.")
+                return
+            link_or_username = payload.split(" ", 1)[1].strip()
+            await self.add_admin_by_link(user, link_or_username)
             return
 
         # --- مدیریت آیتم/آواتار بات: فقط مالک ---
