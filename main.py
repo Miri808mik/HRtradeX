@@ -192,6 +192,28 @@ def save_dances(dances: dict) -> None:
         print(f"save_dances error: {e}")
 
 
+# --- فایل ماندگار ادمین‌ها ---
+ADMINS_FILE = "admins.json"
+
+
+def load_admins() -> set:
+    try:
+        with open(ADMINS_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"load_admins: starting empty ({e})")
+        save_admins(set())
+        return set()
+
+
+def save_admins(admin_ids: set) -> None:
+    try:
+        with open(ADMINS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(admin_ids), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"save_admins error: {e}")
+
+
 class Bot(BaseBot):
     def __init__(self):
         super().__init__()
@@ -221,8 +243,8 @@ class Bot(BaseBot):
         # حالت گزارش: وقتی #گزارش گفته میشه، تا این timestamp چت رو زیر نظر می‌گیره
         self.report_monitoring_until = None
 
-        # ادمین‌هایی که با !ادمین اضافه شدن (فقط RAM، با ری‌استارت پاک میشه)
-        self.admin_ids = set()
+        # ادمین‌هایی که با !ادمین اضافه شدن (توی فایل admins.json ذخیره میشن)
+        self.admin_ids = load_admins()
 
         # جدول دنس‌ها (emote_id -> duration) + وضعیت لوپِ هر کاربر
         self.dances = load_dances()
@@ -349,21 +371,34 @@ class Bot(BaseBot):
         if not username:
             await self.highrise.chat(f"@{requester.username} لینک/یوزرنیم معتبر نیست.")
             return
-        try:
-            result = await self.webapi.get_users(username=username)
-        except Exception as e:
-            print(f"get_users error: {e}")
-            await self.highrise.chat(f"@{requester.username} خطا توی پیدا کردن کاربر.")
-            return
 
-        users = result.users
+        # ظاهراً جستجوی webapi به حروف بزرگ/کوچیک حساسه، پس چندتا حالت رو امتحان می‌کنیم
+        candidates = [username, username.lower(), username.upper(), username.capitalize()]
+        seen = set()
+        users = []
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                result = await self.webapi.get_users(username=candidate)
+            except Exception as e:
+                print(f"get_users error ({candidate}): {e}")
+                continue
+            if result.users:
+                users = result.users
+                break
+
         if not users:
-            await self.highrise.chat(f"@{requester.username} همچین کاربری پیدا نشد.")
+            await self.highrise.chat(
+                f"@{requester.username} همچین کاربری پیدا نشد (یوزرنیم رو دقیق چک کن، حروف بزرگ/کوچیک هم مهمه)."
+            )
             return
 
         target_id = users[0].user_id
         self.admin_ids.add(target_id)
-        await self.highrise.chat(f"@{requester.username} {username} ادمین شد ✅")
+        save_admins(self.admin_ids)
+        await self.highrise.chat(f"@{requester.username} {username} ادمین شد ✅ (برای همیشه ذخیره شد)")
 
     # ---------- حالت گزارش: با #گزارش فعال میشه، چند دقیقه چت رو زیرنظر می‌گیره ----------
     async def start_report_monitoring(self, requester: User) -> None:
