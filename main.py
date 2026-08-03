@@ -7,6 +7,7 @@ import threading
 import subprocess
 import sys
 import asyncio
+from contextlib import suppress
 from datetime import date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict, deque
@@ -130,6 +131,40 @@ DB_API_URL = os.environ.get("DB_API_URL", "").rstrip("/")
 DB_API_SECRET = os.environ.get("DB_API_SECRET", "")
 DATASET_BATCH_SIZE = 100
 
+# --- سیستم مدیریت دنس (جدول + لوپ) ---
+DANCES_FILE = "dances.json"
+LOOP_FACTOR = 0.85  # کمی زودتر از پایان واقعی دوباره صداش می‌زنیم، نه دیرتر (روون‌تر به نظر میاد)
+
+# مقادیر پیش‌فرض؛ فقط اگه فایل dances.json پیدا نشد استفاده میشن
+# نکته‌ی مهم: Highrise هیچ‌جا duration دقیق منتشر نکرده، این‌ها فقط تخمین اولیه‌ن
+# و باید با !دنس <emote_id> <ثانیه> بعد از تست خودت دقیق‌ترشون کنی
+DEFAULT_DANCES = {
+    "dance-floss": 3.6,
+    "dance-macarena": 8.0,
+    "dance-shuffle": 4.4,
+    "dance-twerk": 3.0,
+    "dance-tiktok9": 5.2,
+    "dance-tiktok2": 4.8,
+}
+
+
+def load_dances() -> dict:
+    try:
+        with open(DANCES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"load_dances: using defaults ({e})")
+        save_dances(DEFAULT_DANCES)
+        return DEFAULT_DANCES.copy()
+
+
+def save_dances(dances: dict) -> None:
+    try:
+        with open(DANCES_FILE, "w", encoding="utf-8") as f:
+            json.dump(dances, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"save_dances error: {e}")
+
 
 class Bot(BaseBot):
     def __init__(self):
@@ -159,6 +194,10 @@ class Bot(BaseBot):
 
         # حالت گزارش: وقتی #گزارش گفته میشه، تا این timestamp چت رو زیر نظر می‌گیره
         self.report_monitoring_until = None
+
+        # جدول دنس‌ها (emote_id -> duration) + وضعیت لوپِ هر کاربر
+        self.dances = load_dances()
+        self.user_dance_states = {}  # user_id -> (stop_event, task)
 
         # گشت‌زدن وقتی بیکاره
         self._idle_wander_task = None
@@ -242,6 +281,9 @@ class Bot(BaseBot):
 
     async def on_user_join(self, user: User, position) -> None:
         await self.highrise.chat(f"سلام {user.username} 👋")
+
+    async def on_user_leave(self, user: User) -> None:
+        await self._stop_user_dance(user.id)
 
     def is_owner(self, user: User) -> bool:
         if self.owner_id and user.id == self.owner_id:
@@ -377,6 +419,20 @@ class Bot(BaseBot):
         "eye-color", "eye_color",
     }
 
+    # نگاشت کلمه‌ی فارسی به پیشوند احتمالیِ دسته (حدسیه، چون Highrise لیست رسمی دسته‌ها رو نداده)
+    CATEGORY_ALIASES = {
+        "کلاه": "hat",
+        "عینک": "glasses",
+        "کفش": "shoe",
+    }
+
+    COLOR_CATEGORY_ALIASES = {
+        "چشم": "eye",
+        "مو": "hair",
+        "پوست": "skin",
+        "ابرو": "eyebrow",
+    }
+
     def _get_item_category(self, item_id: str) -> str:
         """
         پیشوند دسته‌ی آیتم رو از روی آیدیش تشخیص میده (مثلاً 'shirt' از 'shirt-abc123').
@@ -458,6 +514,77 @@ class Bot(BaseBot):
             return
         await self.highrise.chat(f"@{requester.username} درش آوردم ✅")
 
+    async def cmd_remove_category(self, requester: User, category: str) -> None:
+        outfit_result = await self.highrise.get_my_outfit()
+        if isinstance(outfit_result, Error):
+            await self.highrise.chat(f"@{requester.username} نتونستم لباس فعلی رو بخونم.")
+            return
+
+        current_items = list(outfit_result.outfit)
+        new_outfit = [it for it in current_items if self._get_item_category(it.id) != category]
+
+        if len(new_outfit) == len(current_items):
+            await self.highrise.chat(f"@{requester.username} چیزی از این دسته پوشیده نبودم.")
+            return
+
+        try:
+            result = await self.highrise.set_outfit(new_outfit)
+        except Exception as e:
+            print(f"set_outfit error: {e}")
+            await self.highrise.chat(f"@{requester.username} درآوردن انجام نشد.")
+            return
+
+        if isinstance(result, Error):
+            await self.highrise.chat(f"@{requester.username} درآوردن ناموفق: {result.message}")
+            return
+        await self.highrise.chat(f"@{requester.username} درش آوردم ✅")
+
+    async def cmd_remove_all(self, requester: User) -> None:
+        try:
+            result = await self.highrise.set_outfit([])
+        except Exception as e:
+            print(f"set_outfit error: {e}")
+            await self.highrise.chat(f"@{requester.username} انجام نشد.")
+            return
+        if isinstance(result, Error):
+            await self.highrise.chat(f"@{requester.username} ناموفق: {result.message}")
+            return
+        await self.highrise.chat(f"@{requester.username} همه‌چیزو درآوردم 😅")
+
+    async def cmd_change_color(self, requester: User, category: str, palette_index: int) -> None:
+        outfit_result = await self.highrise.get_my_outfit()
+        if isinstance(outfit_result, Error):
+            await self.highrise.chat(f"@{requester.username} نتونستم لباس فعلی رو بخونم.")
+            return
+
+        current_items = list(outfit_result.outfit)
+        matched = [it for it in current_items if self._get_item_category(it.id).startswith(category)]
+
+        if not matched:
+            await self.highrise.chat(f"@{requester.username} همچین آیتمی الان پوشیده نیستم که رنگش رو عوض کنم.")
+            return
+
+        new_outfit = [it for it in current_items if it not in matched]
+        for it in matched:
+            new_outfit.append(
+                Item(type=it.type, amount=it.amount, id=it.id, account_bound=it.account_bound, active_palette=palette_index)
+            )
+
+        try:
+            result = await self.highrise.set_outfit(new_outfit)
+        except Exception as e:
+            print(f"set_outfit error: {e}")
+            await self.highrise.chat(f"@{requester.username} تغییر رنگ انجام نشد.")
+            return
+
+        if isinstance(result, Error):
+            await self.highrise.chat(
+                f"@{requester.username} تغییر رنگ ناموفق: {result.message} "
+                f"(ممکنه این دسته اصلاً با active_palette رنگ عوض نکنه)"
+            )
+            return
+        await self.highrise.chat(f"@{requester.username} رنگش عوض شد ✅")
+
     async def cmd_show_outfit(self, requester: User) -> None:
         outfit_result = await self.highrise.get_my_outfit()
         if isinstance(outfit_result, Error):
@@ -476,6 +603,51 @@ class Bot(BaseBot):
             await self.highrise.chat(f"@{requester.username} کمدم خالیه.")
             return
         await self.highrise.chat(f"@{requester.username} توی کمدم: " + ", ".join(ids[:15]))
+
+    # ---------- سیستم لوپ دنس (با جدول duration) ----------
+    async def _user_dance_loop(self, user_id: str, emote_id: str, stop_event: asyncio.Event) -> None:
+        duration = self.dances.get(emote_id)
+        interval = duration * LOOP_FACTOR if duration else None
+
+        while not stop_event.is_set():
+            try:
+                await self.highrise.send_emote(emote_id, user_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"Dance loop error: {e}")
+                return
+
+            if interval is None:
+                # duration ـش رو نداریم، فقط یه‌بار اجرا می‌کنیم (بدون لوپ خودمون)
+                return
+
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+
+    def _start_user_dance(self, user_id: str, emote_id: str) -> None:
+        old = self.user_dance_states.get(user_id)
+        if old:
+            old_event, old_task = old
+            old_event.set()
+            if not old_task.done():
+                old_task.cancel()
+
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(self._user_dance_loop(user_id, emote_id, stop_event))
+        self.user_dance_states[user_id] = (stop_event, task)
+
+    async def _stop_user_dance(self, user_id: str) -> bool:
+        state = self.user_dance_states.pop(user_id, None)
+        if not state:
+            return False
+        stop_event, task = state
+        stop_event.set()
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        return True
 
     async def cmd_show_wallet(self, requester: User) -> None:
         wallet_result = await self.highrise.get_wallet()
@@ -917,22 +1089,19 @@ class Bot(BaseBot):
         if text.startswith("/"):
             payload = text[1:].strip()
             if payload.lower() in {"stop", "استوپ", "متوقف"}:
-                try:
-                    await self.highrise.send_emote("emote-hello", user.id)
-                    await self.highrise.chat(f"@{user.username} دنس متوقف شد ✅")
-                except Exception as e:
-                    print(f"Stop error: {e}")
+                stopped = await self._stop_user_dance(user.id)
+                await self.highrise.chat(
+                    f"@{user.username} دنس متوقف شد ✅" if stopped else f"@{user.username} دنس فعالی نداری"
+                )
                 return
             emote_id = extract_emote_id(payload)
             if not emote_id:
                 await self.highrise.chat(f"@{user.username} فرمت دنس معتبر نیست.")
                 return
-            try:
-                await self.highrise.send_emote(emote_id, user.id)
-                await self.highrise.chat(f"@{user.username} دنس شروع شد 💃 (توقف: /stop)")
-            except Exception as e:
-                print(f"Dance error: {e}")
-                await self.highrise.chat(f"@{user.username} این دنس اجرا نشد.")
+            self._start_user_dance(user.id, emote_id)
+            known = emote_id in self.dances
+            note = "" if known else " (duration نامشخصه، فقط یه‌بار اجرا میشه)"
+            await self.highrise.chat(f"@{user.username} دنس شروع شد 💃{note} (توقف: /stop)")
             return
 
         # --- بقیه فقط با ! ---
@@ -1007,6 +1176,48 @@ class Bot(BaseBot):
             await self.cmd_unwear_item(user, item_id)
             return
 
+        # --- !درآر <کلاه/عینک/کفش/همه> ---
+        if lower.startswith("درآر "):
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            word = payload.split(" ", 1)[1].strip()
+            if word == "همه":
+                await self.cmd_remove_all(user)
+                return
+            category = self.CATEGORY_ALIASES.get(word)
+            if not category:
+                await self.highrise.chat(
+                    f"@{user.username} این دسته رو نمی‌شناسم. الان فقط: کلاه، عینک، کفش، همه"
+                )
+                return
+            await self.cmd_remove_category(user, category)
+            return
+
+        # --- !رنگ <چشم/مو/پوست/ابرو> <شماره> ---
+        if lower.startswith("رنگ "):
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            parts = payload.split()
+            if len(parts) != 3:
+                await self.highrise.chat(f"@{user.username} فرمت درست: !رنگ چشم 5")
+                return
+            word, index_str = parts[1], parts[2]
+            category = self.COLOR_CATEGORY_ALIASES.get(word)
+            if not category:
+                await self.highrise.chat(
+                    f"@{user.username} این دسته رو نمی‌شناسم. الان فقط: چشم، مو، پوست، ابرو"
+                )
+                return
+            try:
+                index = int(index_str)
+            except ValueError:
+                await self.highrise.chat(f"@{user.username} شماره‌ی رنگ باید عدد باشه.")
+                return
+            await self.cmd_change_color(user, category, index)
+            return
+
         if lower in {"لباسام", "outfit"}:
             if not self.is_owner(user):
                 await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
@@ -1019,6 +1230,32 @@ class Bot(BaseBot):
                 await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
                 return
             await self.cmd_show_inventory(user)
+            return
+
+        # --- !دنس <emote_id> <ثانیه> : اضافه/آپدیت‌کردن duration توی جدول ---
+        if lower.startswith("دنس "):
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                return
+            parts = payload.split()
+            if len(parts) != 3:
+                await self.highrise.chat(f"@{user.username} فرمت درست: !دنس dance-floss 7.8")
+                return
+            raw_id, seconds_str = parts[1], parts[2]
+            emote_id = extract_emote_id(raw_id)
+            if not emote_id:
+                await self.highrise.chat(f"@{user.username} آیدی دنس معتبر نیست.")
+                return
+            try:
+                seconds = float(seconds_str)
+                if seconds <= 0:
+                    raise ValueError
+            except ValueError:
+                await self.highrise.chat(f"@{user.username} عدد ثانیه معتبر نیست.")
+                return
+            self.dances[emote_id] = seconds
+            save_dances(self.dances)
+            await self.highrise.chat(f"@{user.username} ذخیره شد ✅ {emote_id} → {seconds} ثانیه")
             return
 
         if lower in {"کیف‌پولم", "کیف پولم", "wallet"}:
