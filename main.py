@@ -372,33 +372,48 @@ class Bot(BaseBot):
             await self.highrise.chat(f"@{requester.username} لینک/یوزرنیم معتبر نیست.")
             return
 
-        # ظاهراً جستجوی webapi به حروف بزرگ/کوچیک حساسه، پس چندتا حالت رو امتحان می‌کنیم
-        candidates = [username, username.lower(), username.upper(), username.capitalize()]
-        seen = set()
-        users = []
-        for candidate in candidates:
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            try:
-                result = await self.webapi.get_users(username=candidate)
-            except Exception as e:
-                print(f"get_users error ({candidate}): {e}")
-                continue
-            if result.users:
-                users = result.users
-                break
+        target_id = None
+        found_username = username
 
-        if not users:
+        # اول توی خودِ روم بگرد (مطمئن‌تره، چون از داده‌ی زنده‌ی خودِ روم میاد)
+        try:
+            room_result = await self.highrise.get_room_users()
+            if not isinstance(room_result, Error):
+                for u, _pos in room_result.content:
+                    if u.username.lower() == username.lower():
+                        target_id = u.id
+                        found_username = u.username
+                        break
+        except Exception as e:
+            print(f"get_room_users (admin lookup) error: {e}")
+
+        # اگه توی روم نبود، بریم سراغ جستجوی عمومی webapi (چندتا حالت حروف رو امتحان می‌کنیم)
+        if target_id is None:
+            candidates = [username, username.lower(), username.upper(), username.capitalize()]
+            seen = set()
+            for candidate in candidates:
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                try:
+                    result = await self.webapi.get_users(username=candidate)
+                except Exception as e:
+                    print(f"get_users error ({candidate}): {e}")
+                    continue
+                if result.users:
+                    target_id = result.users[0].user_id
+                    found_username = result.users[0].username or username
+                    break
+
+        if target_id is None:
             await self.highrise.chat(
-                f"@{requester.username} همچین کاربری پیدا نشد (یوزرنیم رو دقیق چک کن، حروف بزرگ/کوچیک هم مهمه)."
+                f"@{requester.username} پیداش نکردم. اگه الان توی روم حاضره، اسمشو دقیق (بدون فاصله‌ی اضافه) بفرست."
             )
             return
 
-        target_id = users[0].user_id
         self.admin_ids.add(target_id)
         save_admins(self.admin_ids)
-        await self.highrise.chat(f"@{requester.username} {username} ادمین شد ✅ (برای همیشه ذخیره شد)")
+        await self.highrise.chat(f"@{requester.username} {found_username} ادمین شد ✅ (برای همیشه ذخیره شد)")
 
     # ---------- حالت گزارش: با #گزارش فعال میشه، چند دقیقه چت رو زیرنظر می‌گیره ----------
     async def start_report_monitoring(self, requester: User) -> None:
@@ -967,12 +982,12 @@ class Bot(BaseBot):
             {
                 "role": "system",
                 "content": (
-                    "تو یه رفیق صمیمی توی روم Highrise هستی، نه یه بات رسمی. "
-                    "خیلی خیلی کوتاه جواب بده (یکی دو خط، مثل چت واقعی با دوست). "
-                    "لحنت باحال، خودمونی و بامزه باشه، نه رسمی و خشک. "
-                    "اگه بین دوستا شوخی، طعنه، یا فحش دوستانه رد و بدل میشه، جدیش نگیر و باهاشون همراهی/شوخی کن، "
-                    "اصلاً نصیحت نکن و نگو 'لطفاً محترمانه صحبت کنید' یا مشابهش — "
-                    "فقط وقتی واقعاً یه دعوای جدی و پر از توهین می‌بینی جدی برخورد کن (اونم نه با نصیحت، فقط با گزارش به تیم مدیریت که جدا هندل میشه). "
+                    "تو یه بات دخترونه‌ی رسمیِ Highrise هستی، شبیه بات‌های رسمی خودِ اپلیکیشن. "
+                    "مودب، مرتب و کمی گرم و مهربون صحبت کن؛ لحنت باید ملایم و خانومانه باشه، نه شوخ و دلقک‌مانه. "
+                    "خیلی کوتاه جواب بده (یکی دو خط)، ولی رسمی و شمرده، نه با شوخی زیاده یا ایموجی‌های زیاد. "
+                    "به‌جای شوخی‌کردن با فحش‌های دوستانه‌ی کاربرها، فقط بی‌طرفانه و آروم رد شو یا جواب کوتاه بده؛ "
+                    "دیگه خودت رو وارد شوخی‌های تند نکن. "
+                    "فقط وقتی واقعاً یه دعوای جدی و پر از توهین می‌بینی، مودبانه هشدار بده که این رفتار قابل‌قبول نیست. "
                     "جواب‌ها غیرتکراری و طبیعی باشن."
                 ),
             }
@@ -1089,10 +1104,10 @@ class Bot(BaseBot):
             {
                 "role": "system",
                 "content": (
-                    "یه بات فارسیِ Highrise هستی که الان داره به سمت یه کاربر راه میره چون صداش زده. "
-                    "فقط یه جمله‌ی خیلی کوتاه (حداکثر ۱۰ کلمه) و طبیعی بگو که داری میای، "
-                    "و اگه کاربر دلیلی برای صدا زدن گفته (مثلاً 'کارت دارم')، ازش بپرس چیکار داره. "
-                    "بدون توضیح اضافه، فقط همون یه جمله."
+                    "تو یه بات دخترونه‌ی رسمیِ Highrise هستی که الان داره به سمت یه کاربر راه میره چون صداش زده. "
+                    "فقط یه جمله‌ی خیلی کوتاه (حداکثر ۱۰ کلمه)، مودب و ملایم بگو که داری میای، "
+                    "و اگه کاربر دلیلی برای صدا زدن گفته (مثلاً 'کارت دارم')، مودبانه بپرس چیکار داره. "
+                    "بدون شوخی زیاده و بدون توضیح اضافه، فقط همون یه جمله."
                 ),
             },
             {"role": "user", "content": f"{username} گفت: {original_message}"},
