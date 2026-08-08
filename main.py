@@ -131,6 +131,14 @@ DANCE_REPLIES = [
 EXTRA_OWNER_USERNAMES = {"syntaxerror.py"}
 DAILY_AI_LIMIT = 20
 
+# --- مناطق VIP ---
+# هروقت !ثبت VIP گفتی، بات مختصات همون‌جا رو توی چت میگه.
+# همون مختصات رو (x, y, z) این‌جا به‌صورت یه خط جدید اضافه کن، همین‌جا، جای دیگه‌ای لازم نیست.
+# مثال: {"x": 12.5, "y": 0.0, "z": 8.0, "radius": 3.0}
+VIP_ZONES = [
+    # {"x": 0.0, "y": 0.0, "z": 0.0, "radius": 3.0},
+]
+
 # --- تشخیص دعوای واقعی (فقط وقتی کسی #گزارش بزنه، نه همیشه - برای صرفه‌جویی توکن) ---
 REPORT_WINDOW_SECONDS = 3 * 60       # ۳ دقیقه زیرنظر می‌گیره
 MUTE_SECONDS = 2 * 60 * 60           # ۲ ساعت (واحد action_length رو مطمئن نیستیم، احتمالاً ثانیه‌ست)
@@ -732,23 +740,37 @@ class Bot(BaseBot):
     # ---------- سیستم لوپ دنس (با جدول duration) ----------
     async def _user_dance_loop(self, user_id: str, emote_id: str, stop_event: asyncio.Event) -> None:
         duration = self.dances.get(emote_id)
-        interval = duration * LOOP_FACTOR if duration else None
+
+        if duration is None:
+            # duration‌ش رو نداریم، فقط یه‌بار اجرا می‌کنیم (بدون لوپ)
+            try:
+                await asyncio.wait_for(self.highrise.send_emote(emote_id, user_id), timeout=8)
+            except Exception as e:
+                print(f"Dance single-shot error: {e}")
+            return
+
+        interval = duration * LOOP_FACTOR
+        start = time.monotonic()  # مرجع ثابت؛ همه‌ی نوبت‌ها نسبت به همین حساب میشن، نه نسبت به هم
+        cycle = 0
 
         while not stop_event.is_set():
             try:
-                await self.highrise.send_emote(emote_id, user_id)
+                # timeout روی خودِ send_emote، تا اگه شبکه/اتصال یه لحظه گیر کرد،
+                # کل لوپ برای همیشه معلق نمونه
+                await asyncio.wait_for(self.highrise.send_emote(emote_id, user_id), timeout=8)
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                print("Dance loop: send_emote timed out, retrying next cycle")
             except Exception as e:
                 print(f"Dance loop error: {e}")
                 return
 
-            if interval is None:
-                # duration ـش رو نداریم، فقط یه‌بار اجرا می‌کنیم (بدون لوپ خودمون)
-                return
-
+            cycle += 1
+            next_deadline = start + cycle * interval
+            wait_time = max(0.0, next_deadline - time.monotonic())
             with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                await asyncio.wait_for(stop_event.wait(), timeout=wait_time)
 
     def _start_user_dance(self, user_id: str, emote_id: str) -> None:
         old = self.user_dance_states.get(user_id)
@@ -773,6 +795,51 @@ class Bot(BaseBot):
         with suppress(asyncio.CancelledError):
             await task
         return True
+
+    async def cmd_tip(self, requester: User, target_word: str, amount: int) -> None:
+        bar_map = {
+            1: "gold_bar_1", 5: "gold_bar_5", 10: "gold_bar_10", 50: "gold_bar_50",
+            100: "gold_bar_100", 500: "gold_bar_500", 1000: "gold_bar_1k",
+            5000: "gold_bar_5000", 10000: "gold_bar_10k",
+        }
+        bar_name = bar_map.get(amount)
+        if not bar_name:
+            await self.highrise.chat(
+                f"@{requester.username} فقط این مقدارها پشتیبانی میشن: {', '.join(str(a) for a in bar_map)}"
+            )
+            return
+
+        room_result = await self.highrise.get_room_users()
+        if isinstance(room_result, Error):
+            await self.highrise.chat(f"@{requester.username} نتونستم لیست روم رو بخونم.")
+            return
+        all_users = [u for u, _pos in room_result.content if u.id != self.own_user_id]
+
+        if target_word in {"all", "a", "همه"}:
+            targets = all_users
+        else:
+            uname = target_word.lstrip("@").lower()
+            targets = [u for u in all_users if u.username.lower() == uname]
+            if not targets:
+                await self.highrise.chat(f"@{requester.username} این کاربر توی روم پیدا نشد.")
+                return
+
+        success = failed = 0
+        for target in targets:
+            try:
+                result = await self.highrise.tip_user(target.id, bar_name)
+                if result == "success":
+                    success += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                print(f"tip_user error: {e}")
+                failed += 1
+
+        if failed == 0:
+            await self.highrise.chat(f"@{requester.username} تیپ انجام شد ✅ ({success} نفر)")
+        else:
+            await self.highrise.chat(f"@{requester.username} تیپ: {success} موفق، {failed} ناموفق (شاید گلد کافی نبود)")
 
     async def cmd_show_wallet(self, requester: User) -> None:
         wallet_result = await self.highrise.get_wallet()
@@ -982,17 +1049,13 @@ class Bot(BaseBot):
             {
                 "role": "system",
                 "content": (
-                    "تو یه بات دخترونه‌ی رسمیِ Highrise هستی، شبیه بات‌های رسمی خودِ اپلیکیشن. "
-                    "مودب، مرتب و کمی گرم و مهربون صحبت کن؛ لحنت باید ملایم و خانومانه باشه، نه شوخ و دلقک‌مانه. "
-                    "خیلی کوتاه جواب بده (یکی دو خط)، ولی رسمی و شمرده، نه با شوخی زیاده یا ایموجی‌های زیاد. "
-                    "به‌جای شوخی‌کردن با فحش‌های دوستانه‌ی کاربرها، فقط بی‌طرفانه و آروم رد شو یا جواب کوتاه بده؛ "
-                    "دیگه خودت رو وارد شوخی‌های تند نکن. "
-                    "فقط وقتی واقعاً یه دعوای جدی و پر از توهین می‌بینی، مودبانه هشدار بده که این رفتار قابل‌قبول نیست. "
-                    "جواب‌ها غیرتکراری و طبیعی باشن."
+                    "بات رسمی Highrise هستی، آواتارت دخترونه‌ست. رسمی، مودب، کمی گرم؛ نه شوخ، نه زیادی ناناز. "
+                    "خیلی کوتاه جواب بده (۱-۲ خط). "
+                    "اگه پرسیدن جنسیتت چیه: بگو هوش مصنوعی‌ای، جنسیت دختر رو متناسب با آواتارت انتخاب کردی. "
+                    "به فحش دوستانه‌ی کاربرها وارد نشو، فقط خنثی رد شو؛ فقط دعوای جدی رو مودبانه هشدار بده."
                 ),
             }
         ]
-
         long_term_note = await self.get_long_term_memory(user_id)
         if long_term_note:
             messages.append({
@@ -1265,12 +1328,67 @@ class Bot(BaseBot):
             return
 
         # --- !ادمین <لینک/یوزرنیم> : فقط مالک واقعی می‌تونه ادمین اضافه کنه ---
+        # --- !تیپ <همه/all/a/یوزرنیم> <مقدار> یا کوتاه: !t ---
+        # --- !ثبت VIP : مختصات همین لحظه‌ی کاربر رو میگه، خودت دستی توی VIP_ZONES کد اضافه کن ---
+        if lower in {"ثبت vip", "ثبت وی‌آی‌پی", "ثبت وی آی پی"}:
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک/ادمین فعاله.")
+                return
+            room_result = await self.highrise.get_room_users()
+            if isinstance(room_result, Error):
+                await self.highrise.chat(f"@{user.username} نتونستم موقعیت رو بخونم.")
+                return
+            pos = None
+            for u, p in room_result.content:
+                if u.id == user.id and isinstance(p, Position):
+                    pos = p
+                    break
+            if pos is None:
+                await self.highrise.chat(f"@{user.username} موقعیتت رو پیدا نکردم.")
+                return
+            await self.highrise.chat(
+                f"@{user.username} مختصات اینجا: x={pos.x:.2f}, y={pos.y:.2f}, z={pos.z:.2f} "
+                f"— این‌رو توی VIP_ZONES (بالای main.py) اضافه کن"
+            )
+            return
+
+        if lower.startswith("تیپ ") or lower.startswith("t "):
+            if not self.is_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک/ادمین فعاله.")
+                return
+            parts = payload.split()
+            if len(parts) != 3:
+                await self.highrise.chat(f"@{user.username} فرمت درست: !تیپ همه 5  یا  !t a 5")
+                return
+            target_word, amount_str = parts[1], parts[2]
+            try:
+                amount = int(amount_str)
+            except ValueError:
+                await self.highrise.chat(f"@{user.username} مقدار باید عدد باشه.")
+                return
+            await self.cmd_tip(user, target_word, amount)
+            return
+
         if lower.startswith("ادمین "):
             if not self.is_true_owner(user):
                 await self.highrise.chat("این دستور فقط برای مالک اصلی بات فعاله.")
                 return
             link_or_username = payload.split(" ", 1)[1].strip()
             await self.add_admin_by_link(user, link_or_username)
+            return
+
+        # --- !ادمین‌آیدی <user_id خام> : بدون جستجو، مستقیم آیدی رو اضافه می‌کنه ---
+        if lower.startswith("ادمین‌آیدی ") or lower.startswith("ادمین آیدی "):
+            if not self.is_true_owner(user):
+                await self.highrise.chat("این دستور فقط برای مالک اصلی بات فعاله.")
+                return
+            raw_id = payload.split(" ", 1)[1].strip()
+            if not raw_id:
+                await self.highrise.chat(f"@{user.username} آیدی رو بفرست.")
+                return
+            self.admin_ids.add(raw_id)
+            save_admins(self.admin_ids)
+            await self.highrise.chat(f"@{user.username} آیدی {raw_id} ادمین شد ✅ (ذخیره شد)")
             return
 
         # --- مدیریت آیتم/آواتار بات: فقط مالک ---
