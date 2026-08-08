@@ -167,7 +167,8 @@ DATASET_BATCH_SIZE = 100
 
 # --- سیستم مدیریت دنس (جدول + لوپ) ---
 DANCES_FILE = "dances.json"
-LOOP_FACTOR = 0.85  # کمی زودتر از پایان واقعی دوباره صداش می‌زنیم، نه دیرتر (روون‌تر به نظر میاد)
+LOOP_FACTOR = 1.05  # کمی دیرتر از پایان واقعی صداش می‌زنیم، چون زودتر صداش زدن باعث میشد
+                     # سرور به‌خاطر «هنوز داره پخش میشه» درخواست تکراری رو نادیده بگیره (باگ یکی‌درمیون)
 
 # مقادیر پیش‌فرض؛ فقط اگه فایل dances.json پیدا نشد استفاده میشن
 # نکته‌ی مهم: Highrise هیچ‌جا duration دقیق منتشر نکرده، این‌ها فقط تخمین اولیه‌ن
@@ -738,26 +739,32 @@ class Bot(BaseBot):
         await self.highrise.chat(f"@{requester.username} توی کمدم: " + ", ".join(ids[:15]))
 
     # ---------- سیستم لوپ دنس (با جدول duration) ----------
-    async def _user_dance_loop(self, user_id: str, emote_id: str, stop_event: asyncio.Event) -> None:
+    BOT_DANCE_KEY = "__bot__"  # کلید مخصوص لوپ دنس خودِ بات (نه یه کاربر خاص)
+
+    async def _user_dance_loop(self, key: str, emote_id: str, stop_event: asyncio.Event, target_user_id: str | None) -> None:
         duration = self.dances.get(emote_id)
 
+        async def fire():
+            if target_user_id is None:
+                # None یعنی برای خودِ بات (بدون target_user_id، طبق مستندات SDK)
+                await self.highrise.send_emote(emote_id)
+            else:
+                await self.highrise.send_emote(emote_id, target_user_id)
+
         if duration is None:
-            # duration‌ش رو نداریم، فقط یه‌بار اجرا می‌کنیم (بدون لوپ)
             try:
-                await asyncio.wait_for(self.highrise.send_emote(emote_id, user_id), timeout=8)
+                await asyncio.wait_for(fire(), timeout=8)
             except Exception as e:
                 print(f"Dance single-shot error: {e}")
             return
 
         interval = duration * LOOP_FACTOR
-        start = time.monotonic()  # مرجع ثابت؛ همه‌ی نوبت‌ها نسبت به همین حساب میشن، نه نسبت به هم
+        start = time.monotonic()
         cycle = 0
 
         while not stop_event.is_set():
             try:
-                # timeout روی خودِ send_emote، تا اگه شبکه/اتصال یه لحظه گیر کرد،
-                # کل لوپ برای همیشه معلق نمونه
-                await asyncio.wait_for(self.highrise.send_emote(emote_id, user_id), timeout=8)
+                await asyncio.wait_for(fire(), timeout=8)
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
@@ -772,8 +779,11 @@ class Bot(BaseBot):
             with suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(stop_event.wait(), timeout=wait_time)
 
-    def _start_user_dance(self, user_id: str, emote_id: str) -> None:
-        old = self.user_dance_states.get(user_id)
+    def _start_user_dance(self, key: str, emote_id: str, target_user_id: str | None = None) -> None:
+        if target_user_id is None and key != self.BOT_DANCE_KEY:
+            target_user_id = key  # حالت عادی: key همون user_id ـه
+
+        old = self.user_dance_states.get(key)
         if old:
             old_event, old_task = old
             old_event.set()
@@ -781,20 +791,27 @@ class Bot(BaseBot):
                 old_task.cancel()
 
         stop_event = asyncio.Event()
-        task = asyncio.create_task(self._user_dance_loop(user_id, emote_id, stop_event))
-        self.user_dance_states[user_id] = (stop_event, task)
+        task = asyncio.create_task(self._user_dance_loop(key, emote_id, stop_event, target_user_id))
+        self.user_dance_states[key] = (stop_event, task, emote_id)
 
-    async def _stop_user_dance(self, user_id: str) -> bool:
-        state = self.user_dance_states.pop(user_id, None)
+    async def _stop_user_dance(self, key: str) -> bool:
+        state = self.user_dance_states.pop(key, None)
         if not state:
             return False
-        stop_event, task = state
+        stop_event, task = state[0], state[1]
         stop_event.set()
         if not task.done():
             task.cancel()
         with suppress(asyncio.CancelledError):
             await task
         return True
+
+    def _refresh_dances_using(self, emote_id: str) -> None:
+        """وقتی duration یه دنس عوض میشه، هر کسی که الان داره همون دنس رو اجرا می‌کنه، خودکار رفرش میشه."""
+        for key, state in list(self.user_dance_states.items()):
+            if state[2] == emote_id:
+                target_user_id = None if key == self.BOT_DANCE_KEY else key
+                self._start_user_dance(key, emote_id, target_user_id)
 
     async def cmd_tip(self, requester: User, target_word: str, amount: int) -> None:
         bar_map = {
@@ -1509,9 +1526,51 @@ class Bot(BaseBot):
                 seconds = float(seconds_str)
                 self.dances[emote_id] = seconds
                 save_dances(self.dances)
+                self._refresh_dances_using(emote_id)  # هرکی الان همین دنس رو اجرا می‌کنه، خودکار رفرش میشه
                 await self.highrise.chat(f"@{user.username} ذخیره شد ✅ {emote_id} → {seconds} ثانیه")
                 return
+
+            # --- !دنس بات <لینک/آیدی> : خودِ بات این دنس رو (بدون توقف) اجرا می‌کنه ---
+            if len(parts) >= 2 and parts[1] in {"بات", "bot"}:
+                if not self.is_owner(user):
+                    await self.highrise.chat("این دستور فقط برای مالک بات فعاله.")
+                    return
+                if len(parts) < 3:
+                    await self.highrise.chat(f"@{user.username} فرمت درست: !دنس بات <لینک/آیدی>")
+                    return
+                if parts[2].lower() in {"stop", "استوپ", "متوقف"}:
+                    stopped = await self._stop_user_dance(self.BOT_DANCE_KEY)
+                    await self.highrise.chat(
+                        f"@{user.username} دنس بات متوقف شد ✅" if stopped else f"@{user.username} بات الان دنسی نداره"
+                    )
+                    return
+                emote_id = extract_emote_id(parts[2])
+                if not emote_id:
+                    await self.highrise.chat(f"@{user.username} آیدی دنس معتبر نیست.")
+                    return
+                self._start_user_dance(self.BOT_DANCE_KEY, emote_id, target_user_id=None)
+                known = emote_id in self.dances
+                note = "" if known else " (duration نامشخصه، فقط یه‌بار اجرا میشه)"
+                await self.highrise.chat(f"@{user.username} دنس بات شروع شد 💃{note}")
+                return
+
             # فرمت مدیریتی نبود → فال‌ترو به تشخیص خودکار دنس پایین‌تر (find_dance_in_text)
+
+        # --- !اجرا دنس <لینک/آیدی> : اجرای مستقیم بدون نیاز به گفتن ثانیه (اگه از قبل ذخیره شده) ---
+        if lower.startswith("اجرا دنس "):
+            raw = payload.split(" ", 2)
+            if len(raw) < 3:
+                await self.highrise.chat(f"@{user.username} فرمت درست: !اجرا دنس <لینک/آیدی>")
+                return
+            emote_id = extract_emote_id(raw[2].strip())
+            if not emote_id:
+                await self.highrise.chat(f"@{user.username} آیدی دنس معتبر نیست.")
+                return
+            self._start_user_dance(user.id, emote_id)
+            known = emote_id in self.dances
+            note = "" if known else " (duration نامشخصه، فقط یه‌بار اجرا میشه)"
+            await self.highrise.chat(f"@{user.username} دنس شروع شد 💃{note}")
+            return
 
         if lower in {"کیف‌پولم", "کیف پولم", "wallet"}:
             if not self.is_owner(user):
