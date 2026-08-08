@@ -167,8 +167,7 @@ DATASET_BATCH_SIZE = 100
 
 # --- سیستم مدیریت دنس (جدول + لوپ) ---
 DANCES_FILE = "dances.json"
-LOOP_FACTOR = 1.05  # کمی دیرتر از پایان واقعی صداش می‌زنیم، چون زودتر صداش زدن باعث میشد
-                     # سرور به‌خاطر «هنوز داره پخش میشه» درخواست تکراری رو نادیده بگیره (باگ یکی‌درمیون)
+LOOP_EARLY_SECONDS = 0.15  # این عدد رو خودت کم‌وزیاد کن (مثلاً 0.1 یا 0.2) بسته به سرعت اینترنت بات
 
 # مقادیر پیش‌فرض؛ فقط اگه فایل dances.json پیدا نشد استفاده میشن
 # این لیست از یه دیتاست واقعی (نه حدسی) استخراج شده - ۳۸۲ ایموت/دنس با duration دقیق
@@ -1135,7 +1134,7 @@ class Bot(BaseBot):
                 print(f"Dance single-shot error: {e}")
             return
 
-        interval = duration * LOOP_FACTOR
+        interval = max(0.3, duration - LOOP_EARLY_SECONDS)
         start = time.monotonic()
         cycle = 0
 
@@ -1169,7 +1168,7 @@ class Bot(BaseBot):
 
         old = self.user_dance_states.get(key)
         if old:
-            old_event, old_task = old
+            old_event, old_task = old[0], old[1]
             old_event.set()
             if not old_task.done():
                 old_task.cancel()
@@ -1618,6 +1617,15 @@ class Bot(BaseBot):
         self.dataset_buffer.append(text)
         if len(self.dataset_buffer) >= DATASET_BATCH_SIZE:
             asyncio.create_task(self.process_dataset_batch())
+
+        # --- توقف دنس: با هر پیشوندی (/stop، !stop، یا حتی بدون علامت) کار می‌کنه ---
+        stop_words = {"stop", "استوپ", "متوقف", "/stop", "!stop"}
+        if text.strip().lower() in stop_words:
+            stopped = await self._stop_user_dance(user.id)
+            await self.highrise.chat(
+                f"@{user.username} دنس متوقف شد ✅" if stopped else f"@{user.username} دنس فعالی نداری"
+            )
+            return
 
         # --- @روشن : همیشه کار می‌کنه، حتی وقتی خاموشیم ---
         if text in {"@روشن", "@on"}:
